@@ -44,6 +44,7 @@ except ImportError:
 MAX_FUNCTION = 31             # functMap in <l> is 32 bits, so F0-F31 round-trips
 MAX_SPEED = 126
 SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
+CURRENT_POLL_MS = 1000        # how often to ask the station for track current
 MSG_RE = re.compile(rb"<([^>]*)>")
 
 
@@ -173,11 +174,16 @@ class ThrottleApp(tk.Tk):
         self.last_sent = 0.0
         self.last_state = (None, None)  # (speed, dir) actually sent
         self.active_cab = 3            # address _cab_changed last acted on
+        self.current_ma = None         # last reading from <c>; None = unknown
+        self.max_ma = None             # motor driver capability
+        self.trip_ma = None            # software circuit breaker limit
+        self.overload = False          # latched by <p2>, cleared by <p0>/<p1>
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(50, self._pump)
         self.after(30, self._speed_tick)
+        self.after(CURRENT_POLL_MS, self._current_tick)
 
     # ---------------- UI construction ----------------
     def _build_ui(self):
@@ -232,6 +238,28 @@ class ThrottleApp(tk.Tk):
         self.power_state = tk.StringVar(value="power: unknown")
         ttk.Label(power, textvariable=self.power_state).grid(
             row=0, column=6, padx=12, sticky="w")
+
+        # --- Current draw ---------------------------------------------------
+        ttk.Label(power, text="Current:").grid(row=1, column=0, padx=(6, 2),
+                                               pady=(0, 6), sticky="e")
+        self.current_bar = ttk.Progressbar(power, orient="horizontal",
+                                           mode="determinate", length=300)
+        self.current_bar.grid(row=1, column=1, columnspan=4, pady=(0, 6),
+                              sticky="ew")
+        self.current_text = tk.StringVar()
+        # tk.Label, not ttk: the aqua theme ignores foreground on ttk.Label,
+        # and the overload colour is the whole point of this readout.
+        self.current_label = tk.Label(power, textvariable=self.current_text,
+                                      anchor="w", width=24)
+        self.current_label.grid(row=1, column=5, columnspan=2, padx=12,
+                                pady=(0, 6), sticky="w")
+        # Remember the theme's own colour: Tk 9 rejects foreground="" as a
+        # reset, so restoring after an overload needs the real default.
+        self.fg_normal = self.current_label.cget("foreground")
+        self.poll_current = tk.IntVar(value=1)
+        ttk.Checkbutton(power, text="Poll", variable=self.poll_current).grid(
+            row=1, column=7, padx=(0, 8), pady=(0, 6), sticky="w")
+        self._refresh_current()
 
         # --- Loco / throttle ---------------------------------------------
         loco = ttk.LabelFrame(self, text="Locomotive")
@@ -359,21 +387,25 @@ class ThrottleApp(tk.Tk):
         self.connect_btn.configure(text="Connect")
         self.status.set(why)
         self.power_state.set("power: unknown")
+        self._reset_current()      # a stale reading is worse than no reading
         self._log(f"-- {why}", "info")
 
     # ---------------- outbound ----------------
-    def send(self, cmd):
+    def send(self, cmd, quiet=False):
         """True if the command actually reached the wire.
 
         Callers that flipped a widget before sending must revert it on False,
         or the UI ends up asserting a state the loco was never told about.
+        quiet suppresses the console echo for polled traffic.
         """
         if not self.transport:
-            self._log("not connected", "err")
+            if not quiet:
+                self._log("not connected", "err")
             return False
         try:
             self.transport.send(cmd)
-            self._log(f">> {cmd}", "tx")
+            if not quiet:
+                self._log(f">> {cmd}", "tx")
             return True
         except Exception as exc:
             self._disconnect(f"Send failed: {exc}")
@@ -447,6 +479,53 @@ class ThrottleApp(tk.Tk):
         self._log(f"-- loco {cab} selected", "info")
         self._request_cab_state()
 
+    def _current_tick(self):
+        """Poll <c> while connected. Quiet: this would otherwise own the log."""
+        if self.transport and self.poll_current.get():
+            self.send("<c>", quiet=True)
+        self.after(CURRENT_POLL_MS, self._current_tick)
+
+    def _handle_current(self, parts):
+        """<c "CurrentMAIN" current C "Milli" "0" max_ma "1" trip_ma>
+
+        Pulled out by position of the *bare* integers rather than fixed index:
+        the fixed fields are quoted ("0", "1"), so the unquoted numbers are
+        exactly current, max, trip in that order. That also tolerates the
+        shorter <c current> some older builds emit.
+        """
+        nums = [int(p) for p in parts[1:] if p.lstrip("-").isdigit()]
+        if not nums:
+            return
+        self.current_ma = nums[0]
+        if len(nums) >= 3:
+            self.max_ma, self.trip_ma = nums[1], nums[2]
+        self._refresh_current()
+
+    def _refresh_current(self):
+        limit = self.trip_ma or self.max_ma
+        if self.overload:
+            self.current_text.set("OVERLOAD")
+            self.current_label.configure(foreground="#bf616a")
+            self.current_bar.configure(value=self.current_bar["maximum"])
+            return
+        self.current_label.configure(foreground=self.fg_normal)
+        if self.current_ma is None:
+            self.current_text.set("current: --")
+            self.current_bar.configure(value=0)
+            return
+        if limit:
+            self.current_bar.configure(maximum=limit,
+                                       value=min(self.current_ma, limit))
+            self.current_text.set(f"{self.current_ma} mA / {limit} mA trip")
+        else:
+            self.current_bar.configure(value=0)
+            self.current_text.set(f"{self.current_ma} mA")
+
+    def _reset_current(self):
+        self.current_ma = self.max_ma = self.trip_ma = None
+        self.overload = False
+        self._refresh_current()
+
     def _request_cab_state(self):
         """<t cab> asks the station to re-broadcast <l> for this address.
 
@@ -494,7 +573,11 @@ class ThrottleApp(tk.Tk):
                 if kind == "error":
                     self._disconnect(f"Disconnected: {payload}")
                 else:
-                    self._log(f"<< <{payload}>", "rx")
+                    # A polled <c> reply every second would drown the console.
+                    # Only hide it while we are the one asking -- a hand-typed
+                    # <c> with polling off still prints.
+                    if not (self.poll_current.get() and payload.startswith("c ")):
+                        self._log(f"<< <{payload}>", "rx")
                     self._handle(payload)
         except queue.Empty:
             pass
@@ -526,11 +609,18 @@ class ThrottleApp(tk.Tk):
             self.last_state = (speed, direction)
             self.pending_speed = None
 
+        # <c "CurrentMAIN" mA C "Milli" "0" max "1" trip>
+        elif head == "c":
+            self._handle_current(parts)
+
         # <p0> / <p1> / <p1 MAIN>
         elif head.startswith("p") and len(head) == 2 and head[1] in "012":
             track = parts[1] if len(parts) > 1 else "ALL"
             state = {"0": "OFF", "1": "ON", "2": "OVERLOAD"}[head[1]]
             self.power_state.set(f"power: {track} {state}")
+            # p2 latches the overload colour; any later p0/p1 is the all-clear.
+            self.overload = head[1] == "2"
+            self._refresh_current()
 
         # <iDCC-EX V-5.x.x ...>
         elif head.startswith("i"):

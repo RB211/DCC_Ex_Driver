@@ -55,6 +55,7 @@ Owner's dev machine: Apple Silicon MacBook Pro. Home network is UniFi.
 <t cab speed dir>         throttle. speed 0-126, -1 = estop. dir 1=fwd 0=rev
 <F cab func state>        function. func 0-68, state 1/0
 <!>                       emergency stop ALL locos
+<c>                       track current -> <c "CurrentMAIN" ...>. Polled 1/s
 ```
 
 Gotchas the reference spells out:
@@ -75,7 +76,6 @@ Gotchas the reference spells out:
 ### Commands not yet wired into the GUI
 
 ```
-<c>                       current draw
 <R cv> <W cv val>         read / write CV on prog track
 <w cab cv val>            POM write on main
 <T id 1|0>                turnout throw / close
@@ -85,7 +85,14 @@ Gotchas the reference spells out:
 <#>                       max cab slots the station supports (typ. 20/30/50)
 <- [cab]>                 forget one / all locos, freeing reminder slots
 <m cab accel [decel]>     per-loco momentum
+<JI> <JG>                 per-track current / trip lists -> <jI ...> <jG ...>
 ```
+
+`<JI>`/`<JG>` are the TrackManager-era alternative to `<c>`: they report every
+track (A-H) rather than MAIN only, which suits the EX-CSB1's two channels. The
+catch is that the replies are bare numbers in track order with no letters, so
+they only mean anything alongside a `<=>` config query. `<c>` was the simpler
+starting point; `<JI>` is the upgrade path if per-channel readout is wanted.
 
 Full reference: https://dcc-ex.com/reference/software/command-summary-consolidated.html
 Offline copy with more detail: `Documents/dccex-native-protocol.md` (see §6).
@@ -102,6 +109,13 @@ Offline copy with more detail: `Documents/dccex-native-protocol.md` (see §6).
     loco is actually throttled.
 - `<p0>` / `<p1>` / `<p2>` optionally followed by track name — power off / on /
   overload. The track field can also be `JOIN`, which the app prints verbatim.
+- `<c "CurrentMAIN" current C "Milli" "0" max_ma "1" trip_ma>` — reply to `<c>`.
+  A *reply*, not a broadcast: it only arrives when asked. All three useful
+  numbers are in mA — reading, motor-driver capability, and the software
+  circuit-breaker trip. Parse by pulling the **bare** integers rather than by
+  fixed index: the filler fields (`"0"`, `"1"`) are quoted, so unquoted numbers
+  are exactly `current, max, trip` in order, and the short `<c current>` form
+  some builds emit still parses.
 - `<iDCC-EX V-...>` — version banner.
 
 Not yet parsed, in rough order of usefulness:
@@ -237,6 +251,29 @@ machine-specific paths.
   `_on_close()` if unwanted.
 - The raw command box wraps bare input in angle brackets, so `D CABS` works.
 
+### Current display
+
+- Polled by `_current_tick()` every `CURRENT_POLL_MS` (1 s) while connected and
+  while the **Poll** checkbox is ticked. Unticking stops asking the ESP32 at
+  all, not just the display updating.
+- Polled traffic is **quiet in both directions** — one `<c>` per second would
+  own the console. Suppression is conditional on the checkbox, so a hand-typed
+  `<c>` with polling off still prints. That's the only reason `send()` has a
+  `quiet` argument.
+- **The bar scales to `trip_ma`, not `max_ma`.** Trip is the software circuit
+  breaker; how close you are to cutting out is the number that matters, not the
+  driver's theoretical ceiling. Readings above trip clamp the bar but the text
+  still shows the true value.
+- **`<p2>` latches `self.overload`; only a later `<p0>`/`<p1>` clears it.** Do
+  not let a `<c>` reply clear it — after a trip the station often reports a low
+  current, which would repaint the display as healthy while the track is dead.
+- Disconnecting calls `_reset_current()`. A frozen last reading looks live.
+- `self.fg_normal` caches the theme's own label colour at construction because
+  **Tk 9 rejects `foreground=""`** as a reset (`TclError: unknown color name
+  ""`) where Tk 8.5 accepted it. Watch for that idiom elsewhere.
+- Verified against the documented reply format, not yet against real CS-EXB1
+  hardware.
+
 ## 5. Likely next steps
 
 1. Multi-loco: tabs or a roster list, keeping per-address speed/function state
@@ -248,10 +285,11 @@ machine-specific paths.
 3. Programming track panel: `<R cv>`, `<W cv val>`, `<w cab cv val>`, with
    result parsing and a CV name lookup table.
 4. Turnout/accessory panel driven by `<JT>` discovery.
-5. Current/overload display polling `<c>` and reacting to `<p2>`.
-6. Auto-reconnect with backoff; currently a dropped link just reports and stops.
-7. mDNS/bonjour discovery of the command station instead of a typed IP.
-8. Parse `<H id state>` so the turnout burst after `<s>` isn't wasted.
+5. Auto-reconnect with backoff; currently a dropped link just reports and stops.
+6. mDNS/bonjour discovery of the command station instead of a typed IP.
+7. Parse `<H id state>` so the turnout burst after `<s>` isn't wasted.
+8. Per-track current via `<JI>`/`<JG>` + `<=>` instead of MAIN-only `<c>`,
+   which would show both EX-CSB1 channels separately.
 
 ## 6. Documents/ — offline protocol reference
 

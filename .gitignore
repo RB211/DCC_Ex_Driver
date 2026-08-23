@@ -5,7 +5,8 @@
 __pycache__/
 *.py[cod]
 
-# Claude Code local settings (machine-specific paths, not shareable)
+# Editor / Claude Code local settings (machine-specific paths, not shareable)
+.vscode/
 .claude/settings.local.json
 
 # build.sh output — regenerate with the toolchain, don't track

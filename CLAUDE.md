@@ -118,8 +118,36 @@ Not yet parsed, in rough order of usefulness:
 
 ## 4. Current implementation
 
-Single file, `dccex_throttle.py`. Python 3, **stdlib only**. `pyserial` is an
-optional import — the Serial radio button disables itself if it's absent.
+Single file, `dccex_throttle.py`. **Stdlib only** — `pyserial` is the sole
+third-party import, and an optional one at that (the Serial radio button
+disables itself if it's absent).
+
+### Environment — use the venv
+
+```
+.venv/bin/python dccex_throttle.py
+```
+
+`.venv` is built on **Homebrew python3.14** and is the only supported way to
+run this. It is gitignored; recreate with:
+
+```
+python3.14 -m venv .venv && .venv/bin/pip install pyserial
+```
+
+**Do not run this on the pyenv 3.10.18 that used to be the default.** That
+build links against Apple's **Tcl/Tk 8.5.9**, which renders the GUI at the
+wrong scale on modern macOS. Homebrew 3.14.7 ships **Tk 9.0.4** and lays out
+correctly — same code, 960x803 instead of a cramped 858x789. Tk version is the
+thing that matters here, not the Python version, so check
+`tkinter.Tcl().call('info', 'patchlevel')` before blaming layout code.
+
+`.vscode/settings.json` pins the interpreter to
+`${workspaceFolder}/.venv/bin/python`.
+Without it VS Code picks a bare Homebrew python3 that has no pyserial,
+and Pylance reports three spurious *"Import 'serial' could not be resolved from
+source"* warnings. Both `.vscode/` and `.venv/` are gitignored — they hold
+machine-specific paths.
 
 ### Structure
 

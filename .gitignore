@@ -4,6 +4,7 @@
 # Python
 __pycache__/
 *.py[cod]
+.venv/
 
 # Editor / Claude Code local settings (machine-specific paths, not shareable)
 .vscode/

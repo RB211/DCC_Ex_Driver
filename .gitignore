@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Claude Code local settings (machine-specific paths, not shareable)
+.claude/settings.local.json
+
+# build.sh output — regenerate with the toolchain, don't track
+Documents/out/
+Documents/parts/

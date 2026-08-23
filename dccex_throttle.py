@@ -342,6 +342,10 @@ class ThrottleApp(tk.Tk):
         self.connect_btn.configure(text="Disconnect")
         self.status.set(f"Connected to {where}")
         self._log(f"-- connected to {where}", "info")
+        # Anything the slider did while offline is not a command the user meant
+        # to issue now, and we know nothing about the loco until <l> arrives.
+        self.pending_speed = None
+        self.last_state = (None, None)
         self.send("<s>")          # forces native protocol mode + returns status
         self._request_cab_state()  # sync the selected loco instead of guessing
 
@@ -405,10 +409,16 @@ class ThrottleApp(tk.Tk):
     def _speed_tick(self):
         """Rate-limited send so dragging the slider doesn't flood the station."""
         if self.transport and self.pending_speed is not None:
-            now = time.monotonic()
             target = (self.pending_speed, self.direction.get())
-            if target != self.last_state and (now - self.last_sent) >= SEND_INTERVAL:
+            if target == self.last_state:
+                # Slider landed back where the station already is (a nudge and
+                # an undo inside one SEND_INTERVAL). Nothing to send -- retire
+                # the request instead of re-testing it every 30 ms forever.
+                self.pending_speed = None
+            elif (time.monotonic() - self.last_sent) >= SEND_INTERVAL:
                 self._send_throttle(*target)
+                # Cleared even on a failed send: the transport is gone, and a
+                # stale value must not be replayed at the loco on reconnect.
                 self.pending_speed = None
         self.after(30, self._speed_tick)
 

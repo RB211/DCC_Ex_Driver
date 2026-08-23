@@ -359,14 +359,27 @@ class ThrottleApp(tk.Tk):
 
     # ---------------- outbound ----------------
     def send(self, cmd):
+        """True if the command actually reached the wire.
+
+        Callers that flipped a widget before sending must revert it on False,
+        or the UI ends up asserting a state the loco was never told about.
+        """
         if not self.transport:
             self._log("not connected", "err")
-            return
+            return False
         try:
             self.transport.send(cmd)
             self._log(f">> {cmd}", "tx")
+            return True
         except Exception as exc:
             self._disconnect(f"Send failed: {exc}")
+            return False
+
+    def _set_quiet(self, var, value):
+        """Write a widget var without tripping its own callback."""
+        self.syncing = True
+        var.set(value)
+        self.syncing = False
 
     def _send_raw(self, *_):
         text = self.raw.get().strip()
@@ -378,9 +391,11 @@ class ThrottleApp(tk.Tk):
         self.raw.set("")
 
     def _send_throttle(self, speed, direction):
+        if not self.send(f"<t {self.cab.get()} {speed} {direction}>"):
+            return False
         self.last_state = (speed, direction)
         self.last_sent = time.monotonic()
-        self.send(f"<t {self.cab.get()} {speed} {direction}>")
+        return True
 
     def _speed_moved(self, _value):
         if self.syncing:
@@ -400,7 +415,8 @@ class ThrottleApp(tk.Tk):
     def _dir_changed(self):
         if self.syncing:
             return
-        self._send_throttle(self.speed.get(), self.direction.get())
+        if not self._send_throttle(self.speed.get(), self.direction.get()):
+            self._set_quiet(self.direction, 1 - self.direction.get())
 
     def _cab_changed(self, *_):
         try:
@@ -432,30 +448,33 @@ class ThrottleApp(tk.Tk):
             self.send(f"<t {self.active_cab}>")
 
     def _stop(self):
-        self.syncing = True
-        self.speed.set(0)
-        self.syncing = False
+        prior = self.speed.get()
+        self._set_quiet(self.speed, 0)
         self.pending_speed = None
-        self._send_throttle(0, self.direction.get())
+        if not self._send_throttle(0, self.direction.get()):
+            self._set_quiet(self.speed, prior)   # the loco never got the stop
 
     def _estop_all(self):
-        self.syncing = True
-        self.speed.set(0)
-        self.syncing = False
+        if not self.send("<!>"):
+            return
+        self._set_quiet(self.speed, 0)
         self.pending_speed = None
         self.last_state = (0, self.direction.get())
-        self.send("<!>")
 
     def _func_toggled(self, n):
         if self.syncing:
             return
-        self.send(f"<F {self.cab.get()} {n} {self.func_vars[n].get()}>")
+        var = self.func_vars[n]
+        if not self.send(f"<F {self.cab.get()} {n} {var.get()}>"):
+            self._set_quiet(var, 1 - var.get())    # undo the click Tk already applied
 
     def _all_funcs_off(self):
         for n, var in self.func_vars.items():
-            if var.get():
-                var.set(0)
-                self.send(f"<F {self.cab.get()} {n} 0>")
+            if not var.get():
+                continue
+            if not self.send(f"<F {self.cab.get()} {n} 0>"):
+                return          # link is down; leave the rest showing their real state
+            self._set_quiet(var, 0)
 
     # ---------------- inbound ----------------
     def _pump(self):

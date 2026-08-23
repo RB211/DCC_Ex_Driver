@@ -145,6 +145,14 @@ optional import — the Serial radio button disables itself if it's absent.
   spinbox is bound to `<FocusOut>` as well as `<Return>` and `command=`, so
   without this guard every focus change would re-zero the UI and re-request
   state.
+- **`send()` returns True only if the command reached the wire.** Tk applies a
+  click to the widget *before* the callback runs, so any callback that flips a
+  widget and then sends must revert it on False — otherwise the UI asserts a
+  state the loco was never told about, and since a failed send also tears down
+  the transport, no broadcast will ever arrive to correct it. `_set_quiet()`
+  does the revert under the `syncing` guard. Applies to `_func_toggled`,
+  `_all_funcs_off`, `_dir_changed`, `_stop` and `_estop_all`; the last two
+  also refuse to zero the slider or `last_state` on a failed send.
 - **`_read_some()` has a three-way return** and each value means something
   different to `_read_loop`:
   - `bytes` — data, append to the buffer.

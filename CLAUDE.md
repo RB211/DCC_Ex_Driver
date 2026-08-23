@@ -140,7 +140,27 @@ optional import — the Serial radio button disables itself if it's absent.
   broadcast. Every widget callback must return early when it's true, or you
   get an infinite echo loop between the app and the command station.
 - **`self.last_state`** holds the `(speed, dir)` tuple actually transmitted.
-  The speed tick compares against it to avoid duplicate sends.
+  The speed tick compares against it to avoid duplicate sends. Only
+  `_send_throttle()` commits it, and only after a successful send. `(None,
+  None)` means "the loco's state is unknown", which forces the next slider
+  move to transmit.
+- **`self.pending_speed` is a one-shot request, not a mirror of the slider.**
+  `None` means nothing is owed to the station. Lifecycle:
+  - *Armed* only by `_speed_moved()`, on real user input (it returns early
+    when `syncing`).
+  - *Retired* by `_speed_tick()` on all three of its exits — sent, redundant
+    (`target == last_state`), or send failed. *Every* path out must clear it.
+    Leaving it armed is the bug that made the tick re-test the same value
+    every 30 ms forever.
+  - *Discarded* wherever the slider's intent stops being meaningful:
+    `_cab_changed()` (different loco), `_stop()` / `_estop_all()` (an explicit
+    stop outranks a queued speed), `_handle()` on an inbound `<l>` (the
+    station just told us the truth), and `_toggle_connect()`.
+  The `_toggle_connect()` one is the subtle one. Dragging the slider while
+  disconnected arms the flag with no transport to consume it, so without the
+  clear, the first tick after Connect would issue `<t cab speed dir>` and the
+  loco would take off with the user having touched nothing since connecting.
+  **Never let a value survive from one connection into the next.**
 - **`self.active_cab`** is the address `_cab_changed` last acted on. The
   spinbox is bound to `<FocusOut>` as well as `<Return>` and `command=`, so
   without this guard every focus change would re-zero the UI and re-request

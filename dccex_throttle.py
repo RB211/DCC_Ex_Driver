@@ -56,7 +56,9 @@ except ImportError:
     list_ports = None
 HAVE_SERIAL = serial is not None
 
-FUNCTIONS = range(1, 9)       # F1-F8, all momentary: on while held, off on release
+FUNCTIONS = range(1, 9)       # F1-F8, momentary: on while held, off on release
+PULSE_FUNCS = {3}             # decoder sounds these on BOTH edges: pulse on press only
+FUNC_PULSE_MS = 120           # on-to-off gap for pulsed functions
 MAX_SPEED = 126
 SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
 CURRENT_POLL_MS = 1000        # how often to ask the station for track current
@@ -395,14 +397,18 @@ class ThrottleApp(tk.Tk):
         self.func_vars = {}
         cols = 4
         for i, n in enumerate(FUNCTIONS):
-            # All momentary: <F 1> on press, <F 0> on release. No variable --
-            # the widget's pressed look is the feedback, and func_vars[n]
-            # still tracks the real state via the <l> broadcast.
+            # Momentary (<F 1> on press, <F 0> on release) except PULSE_FUNCS,
+            # which pulse on press. No variable -- the widget's pressed look is
+            # the feedback, and func_vars[n] still tracks the real state via
+            # the <l> broadcast.
             var = tk.IntVar(value=0)
             self.func_vars[n] = var
             w = ttk.Button(funcs, text=f"F{n}", style="Func.TButton")
-            w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
-            w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
+            if n in PULSE_FUNCS:
+                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_pulse(k))
+            else:
+                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
+                w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
             w.grid(row=i // cols, column=i % cols, sticky="nsew", padx=6, pady=5)
         func_rows = (len(FUNCTIONS) + cols - 1) // cols
         for c in range(cols):
@@ -767,6 +773,15 @@ class ThrottleApp(tk.Tk):
         with the link leaves func_vars[n] to be corrected by the next <l>
         broadcast."""
         self.send_cmd(f"<F {self.cab.get()} {n} {state}>")
+
+    def _func_pulse(self, n):
+        """Press for PULSE_FUNCS: one on/off pulse per click, release ignored.
+        The decoder acts on both edges, so tying the off to the button release
+        would sound the function twice. Cab is captured at press so the off
+        reaches the same loco even if the spinbox changes mid-pulse."""
+        cab = self.cab.get()
+        if self.send_cmd(f"<F {cab} {n} 1>"):
+            self.after(FUNC_PULSE_MS, lambda: self.send_cmd(f"<F {cab} {n} 0>"))
 
     def _all_funcs_off(self):
         for n, var in self.func_vars.items():

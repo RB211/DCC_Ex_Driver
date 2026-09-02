@@ -74,9 +74,12 @@ Gotchas the reference spells out:
   deprecated `<f cab byte1 byte2>` form. But `functMap` in the `<l>` broadcast
   is only 32 bits, so **F0-F31 is the practical ceiling** for anything that
   needs to stay in sync. The app currently exposes **F1-F8 only**
-  (`FUNCTIONS = range(1, 9)`), every one of them momentary: plain
-  `ttk.Button`s with press/release bindings that send `<F 1>` / `<F 0>`
-  (`_func_momentary`). There is no latched widget state to revert on a failed
+  (`FUNCTIONS = range(1, 9)`), momentary: plain `ttk.Button`s with
+  press/release bindings that send `<F 1>` / `<F 0>` (`_func_momentary`).
+  Exception: `PULSE_FUNCS` (F3, the owner's short whistle) fire a single
+  on/off pulse on press (`_func_pulse`, `FUNC_PULSE_MS` gap) because the
+  decoder sounds on both edges — release-driven off made it toot twice.
+  There is no latched widget state to revert on a failed
   send; `func_vars` mirrors the true state from `<l>` broadcasts, and it is
   what `_all_funcs_off` consults. Going past F31 means accepting write-only
   functions that no broadcast can ever correct.

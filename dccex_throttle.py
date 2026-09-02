@@ -423,24 +423,36 @@ class ThrottleApp(tk.Tk):
         funcs.pack(fill="both", expand=True, padx=6, pady=4)
         self.func_vars = {}
         self.func_buttons = {}
+        self.func_holders = {}
+        # The active indicator is a 3 px border painted on a tk.Frame wrapped
+        # around each button -- ttk button borders aren't colourable on aqua,
+        # a frame background is. Off = the surrounding background, invisible.
+        self.func_border_off = (style.lookup("TFrame", "background")
+                                or self.cget("background"))
         self.toggle_funcs = self._load_func_modes()
         cols = 10  # decade rows: F0-F9 / F10-F19 / F20-F28
         for i, n in enumerate(FUNCTIONS):
             # Momentary (<F 1> on press, <F 0> on release) or toggle (one
             # command per press, alternating 1/0). Right-click flips a
             # button's mode; toggle mode shows as underlined text. No
-            # variable on the widget -- its pressed look is the feedback, and
-            # func_vars[n] still tracks the real state via the <l> broadcast.
+            # variable on the widget -- func_vars[n] tracks the real state
+            # via the <l> broadcast, and the trace paints the green border
+            # whenever that state changes, whoever changed it.
             var = tk.IntVar(value=0)
             self.func_vars[n] = var
-            w = ttk.Button(funcs, text=f"F{n}")
+            holder = tk.Frame(funcs, background=self.func_border_off)
+            self.func_holders[n] = holder
+            w = ttk.Button(holder, text=f"F{n}")
             self.func_buttons[n] = w
+            w.pack(fill="both", expand=True, padx=3, pady=3)
             w.bind("<ButtonPress-1>", lambda e, k=n: self._func_press(k))
             w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_release(k))
             for ev in ("<Button-3>", "<Button-2>"):  # right-click; aqua pre-Tk 8.7 reports it as 2
                 w.bind(ev, lambda e, k=n: self._func_mode_flip(k))
             self._style_func_button(n)
-            w.grid(row=i // cols, column=i % cols, sticky="nsew", padx=6, pady=5)
+            var.trace_add("write", lambda *_, k=n: self._refresh_func_lamp(k))
+            holder.grid(row=i // cols, column=i % cols, sticky="nsew",
+                        padx=4, pady=3)
         func_rows = (len(FUNCTIONS) + cols - 1) // cols
         for c in range(cols):
             funcs.columnconfigure(c, weight=1)
@@ -844,6 +856,14 @@ class ThrottleApp(tk.Tk):
         self.func_buttons[n].configure(
             style="FuncToggle.TButton" if n in self.toggle_funcs
             else "Func.TButton")
+
+    def _refresh_func_lamp(self, n):
+        """Paint the border frame green while Fn is on. Driven by a trace on
+        func_vars[n], so every writer -- the <l> broadcast, a toggle press,
+        _all_funcs_off, the cab-change zeroing -- repaints it for free."""
+        self.func_holders[n].configure(
+            background="#2e7d32" if self.func_vars[n].get()
+            else self.func_border_off)
 
     def _load_func_modes(self):
         """The set of toggle-mode functions: CONFIG_PATH if readable and

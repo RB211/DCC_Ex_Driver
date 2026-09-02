@@ -208,19 +208,27 @@ serial support. Under the tiling WM the window is stretched to fill its tile,
 so judge layout by `winfo_reqwidth()`/`winfo_reqheight()`, never by actual
 window size.
 
-### Release packaging (Linux)
+### Release packaging
 
-One-file standalone binary via PyInstaller, published as a GitHub release
-(first: v0.1.0, asset `dccex-throttle-linux-x86_64`):
+One-file standalone binary via PyInstaller, published as a GitHub release.
+Same commands on both platforms:
 
 ```
 .venv/bin/pip install pyinstaller
 .venv/bin/pyinstaller --onefile --windowed --name dccex-throttle dccex_throttle.py
 ```
 
-Output lands in `dist/` (gitignored along with `build/` and `*.spec`). The
-binary links the build machine's glibc, so an Arch-built one needs a
-comparably recent distro — rebuild from source for older systems.
+Output lands in `dist/` (gitignored along with `build/` and `*.spec`).
+
+- **Linux** (asset `dccex-throttle-linux-x86_64`, since v0.1.0): ship the
+  bare `dist/dccex-throttle`. It links the build machine's glibc, so an
+  Arch-built one needs a comparably recent distro — rebuild from source
+  for older systems.
+- **macOS** (asset `dccex-throttle-macos-arm64.app.zip`, since v0.1.1):
+  `--windowed` also emits `dist/dccex-throttle.app`; ship that, zipped with
+  `ditto -c -k --keepParent` (plain `zip` loses bundle metadata). Unsigned,
+  so first launch needs right-click → Open or
+  `xattr -d com.apple.quarantine`. Apple Silicon only.
 
 ### Structure
 

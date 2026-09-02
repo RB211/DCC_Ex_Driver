@@ -207,7 +207,9 @@ machine-specific paths.
   spinbox is bound to `<FocusOut>` as well as `<Return>` and `command=`, so
   without this guard every focus change would re-zero the UI and re-request
   state.
-- **`send()` returns True only if the command reached the wire.** Tk applies a
+- **`send_cmd()` returns True only if the command reached the wire.** (Named
+  `send_cmd` because `tk.Misc` already owns `send()` — Tk's inter-interpreter
+  send — and overriding it trips Pylance and risks confusion.) Tk applies a
   click to the widget *before* the callback runs, so any callback that flips a
   widget and then sends must revert it on False — otherwise the UI asserts a
   state the loco was never told about, and since a failed send also tears down
@@ -258,7 +260,7 @@ machine-specific paths.
   all, not just the display updating.
 - Polled traffic is **quiet in both directions** — one `<c>` per second would
   own the console. Suppression is conditional on the checkbox, so a hand-typed
-  `<c>` with polling off still prints. That's the only reason `send()` has a
+  `<c>` with polling off still prints. That's the only reason `send_cmd()` has a
   `quiet` argument.
 - **The bar scales to `trip_ma`, not `max_ma`.** Trip is the software circuit
   breaker; how close you are to cutting out is the number that matters, not the

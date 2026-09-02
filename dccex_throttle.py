@@ -37,9 +37,10 @@ from tkinter import ttk, messagebox
 try:
     import serial
     from serial.tools import list_ports
-    HAVE_SERIAL = True
 except ImportError:
-    HAVE_SERIAL = False
+    serial = None
+    list_ports = None
+HAVE_SERIAL = serial is not None
 
 MAX_FUNCTION = 31             # functMap in <l> is 32 bits, so F0-F31 round-trips
 MAX_SPEED = 126
@@ -133,6 +134,8 @@ class TcpTransport(BaseTransport):
 
 class SerialTransport(BaseTransport):
     def __init__(self, rx_queue, port, baud=115200):
+        if serial is None:
+            raise TransportError("pyserial is not installed (pip install pyserial)")
         super().__init__(rx_queue)
         self.ser = serial.Serial(port, baud, timeout=0.4)
         time.sleep(0.2)
@@ -187,11 +190,9 @@ class ThrottleApp(tk.Tk):
 
     # ---------------- UI construction ----------------
     def _build_ui(self):
-        pad = dict(padx=6, pady=4)
-
         # --- Connection -------------------------------------------------
         conn = ttk.LabelFrame(self, text="Connection")
-        conn.pack(fill="x", **pad)
+        conn.pack(fill="x", padx=6, pady=4)
 
         self.mode = tk.StringVar(value="tcp")
         ttk.Radiobutton(conn, text="TCP", variable=self.mode, value="tcp",
@@ -227,14 +228,14 @@ class ThrottleApp(tk.Tk):
 
         # --- Track power ------------------------------------------------
         power = ttk.LabelFrame(self, text="Track Power")
-        power.pack(fill="x", **pad)
+        power.pack(fill="x", padx=6, pady=4)
         for i, (label, cmd) in enumerate([
             ("ALL ON", "<1>"), ("ALL OFF", "<0>"),
             ("MAIN ON", "<1 MAIN>"), ("MAIN OFF", "<0 MAIN>"),
             ("PROG ON", "<1 PROG>"), ("PROG OFF", "<0 PROG>"),
         ]):
             ttk.Button(power, text=label, width=10,
-                       command=lambda c=cmd: self.send(c)).grid(row=0, column=i, padx=3, pady=5)
+                       command=lambda c=cmd: self.send_cmd(c)).grid(row=0, column=i, padx=3, pady=5)
         self.power_state = tk.StringVar(value="power: unknown")
         ttk.Label(power, textvariable=self.power_state).grid(
             row=0, column=6, padx=12, sticky="w")
@@ -263,7 +264,7 @@ class ThrottleApp(tk.Tk):
 
         # --- Loco / throttle ---------------------------------------------
         loco = ttk.LabelFrame(self, text="Locomotive")
-        loco.pack(fill="x", **pad)
+        loco.pack(fill="x", padx=6, pady=4)
 
         ttk.Label(loco, text="Address:").grid(row=0, column=0, padx=(6, 2), pady=6, sticky="e")
         self.cab = tk.IntVar(value=3)
@@ -296,7 +297,7 @@ class ThrottleApp(tk.Tk):
 
         # --- Functions -----------------------------------------------------
         funcs = ttk.LabelFrame(self, text="Functions")
-        funcs.pack(fill="x", **pad)
+        funcs.pack(fill="x", padx=6, pady=4)
         self.func_vars = {}
         cols = 6
         for n in range(0, MAX_FUNCTION + 1):
@@ -312,7 +313,7 @@ class ThrottleApp(tk.Tk):
 
         # --- Console --------------------------------------------------------
         console = ttk.LabelFrame(self, text="Console")
-        console.pack(fill="both", expand=True, **pad)
+        console.pack(fill="both", expand=True, padx=6, pady=4)
         self.log = tk.Text(console, height=10, wrap="none", state="disabled",
                            font=("Menlo", 11), background="#101418", foreground="#d8dee9")
         self.log.pack(side="top", fill="both", expand=True, padx=4, pady=4)
@@ -338,7 +339,7 @@ class ThrottleApp(tk.Tk):
         self.refresh_btn.configure(state=state)
 
     def _refresh_ports(self):
-        if not HAVE_SERIAL:
+        if list_ports is None:
             self.port_combo["values"] = ["pyserial not installed"]
             return
         ports = [p.device for p in list_ports.comports()]
@@ -374,7 +375,7 @@ class ThrottleApp(tk.Tk):
         # to issue now, and we know nothing about the loco until <l> arrives.
         self.pending_speed = None
         self.last_state = (None, None)
-        self.send("<s>")          # forces native protocol mode + returns status
+        self.send_cmd("<s>")          # forces native protocol mode + returns status
         self._request_cab_state()  # sync the selected loco instead of guessing
 
     def _disconnect(self, why):
@@ -391,7 +392,9 @@ class ThrottleApp(tk.Tk):
         self._log(f"-- {why}", "info")
 
     # ---------------- outbound ----------------
-    def send(self, cmd, quiet=False):
+    # Named send_cmd, not send: tk.Misc already defines send() (Tk's
+    # inter-interpreter send) and overriding it with this signature clashes.
+    def send_cmd(self, cmd, quiet=False):
         """True if the command actually reached the wire.
 
         Callers that flipped a widget before sending must revert it on False,
@@ -423,11 +426,11 @@ class ThrottleApp(tk.Tk):
             return
         if not text.startswith("<"):
             text = f"<{text}>"
-        self.send(text)
+        self.send_cmd(text)
         self.raw.set("")
 
     def _send_throttle(self, speed, direction):
-        if not self.send(f"<t {self.cab.get()} {speed} {direction}>"):
+        if not self.send_cmd(f"<t {self.cab.get()} {speed} {direction}>"):
             return False
         self.last_state = (speed, direction)
         self.last_sent = time.monotonic()
@@ -482,7 +485,7 @@ class ThrottleApp(tk.Tk):
     def _current_tick(self):
         """Poll <c> while connected. Quiet: this would otherwise own the log."""
         if self.transport and self.poll_current.get():
-            self.send("<c>", quiet=True)
+            self.send_cmd("<c>", quiet=True)
         self.after(CURRENT_POLL_MS, self._current_tick)
 
     def _handle_current(self, parts):
@@ -534,7 +537,7 @@ class ThrottleApp(tk.Tk):
         table yet; the zeroed UI is already the right answer in that case.
         """
         if self.transport:
-            self.send(f"<t {self.active_cab}>")
+            self.send_cmd(f"<t {self.active_cab}>")
 
     def _stop(self):
         prior = self.speed.get()
@@ -544,7 +547,7 @@ class ThrottleApp(tk.Tk):
             self._set_quiet(self.speed, prior)   # the loco never got the stop
 
     def _estop_all(self):
-        if not self.send("<!>"):
+        if not self.send_cmd("<!>"):
             return
         self._set_quiet(self.speed, 0)
         self.pending_speed = None
@@ -554,14 +557,14 @@ class ThrottleApp(tk.Tk):
         if self.syncing:
             return
         var = self.func_vars[n]
-        if not self.send(f"<F {self.cab.get()} {n} {var.get()}>"):
+        if not self.send_cmd(f"<F {self.cab.get()} {n} {var.get()}>"):
             self._set_quiet(var, 1 - var.get())    # undo the click Tk already applied
 
     def _all_funcs_off(self):
         for n, var in self.func_vars.items():
             if not var.get():
                 continue
-            if not self.send(f"<F {self.cab.get()} {n} 0>"):
+            if not self.send_cmd(f"<F {self.cab.get()} {n} 0>"):
                 return          # link is down; leave the rest showing their real state
             self._set_quiet(var, 0)
 

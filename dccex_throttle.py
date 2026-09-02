@@ -62,6 +62,46 @@ SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
 CURRENT_POLL_MS = 1000        # how often to ask the station for track current
 MSG_RE = re.compile(rb"<([^>]*)>")
 
+# Common NMRA S-9.2.2 CV names for the Programming tab's live lookup.
+CV_NAMES = {
+    1: "Primary (short) address",
+    2: "Vstart -- motor start voltage",
+    3: "Acceleration rate",
+    4: "Deceleration rate",
+    5: "Vhigh -- top speed voltage",
+    6: "Vmid -- mid speed voltage",
+    7: "Manufacturer version, read-only",
+    8: "Manufacturer ID -- writing it resets many decoders",
+    17: "Extended address high byte",
+    18: "Extended address low byte",
+    19: "Consist address",
+    21: "Consist functions F1-F8",
+    22: "Consist functions FL, F9-F12",
+    23: "Acceleration adjustment",
+    24: "Deceleration adjustment",
+    28: "RailCom configuration",
+    29: "Configuration data #1",
+    30: "Error information",
+    65: "Kick start",
+    66: "Forward trim",
+    95: "Reverse trim",
+    105: "User ID #1",
+    106: "User ID #2",
+}
+
+
+def cv_name(cv):
+    """Best-effort NMRA name for a CV number, or None if unremarkable."""
+    if cv in CV_NAMES:
+        return CV_NAMES[cv]
+    if 33 <= cv <= 46:
+        return "Function output mapping"
+    if 67 <= cv <= 94:
+        return f"Speed table entry {cv - 66}/28"
+    if 112 <= cv <= 256:
+        return "Manufacturer-specific"
+    return None
+
 
 # --------------------------------------------------------------------------
 # Transports
@@ -395,6 +435,11 @@ class ThrottleApp(tk.Tk):
             row=2, column=4, padx=4, pady=4)
         ttk.Button(svc, text="Write CV", command=self._write_cv).grid(
             row=2, column=5, padx=4, pady=4)
+        self.prog_cv_name = tk.StringVar()
+        ttk.Label(svc, textvariable=self.prog_cv_name, foreground="#888").grid(
+            row=2, column=6, sticky="w", padx=6)
+        self.prog_cv.trace_add("write", lambda *_: self._cv_name_changed(
+            self.prog_cv, self.prog_cv_name))
 
         self.prog_result = tk.StringVar(value="result: --")
         ttk.Label(svc, textvariable=self.prog_result).grid(
@@ -441,6 +486,11 @@ class ThrottleApp(tk.Tk):
             row=1, column=3, sticky="w", padx=(2, 6))
         ttk.Button(pom, text="Write on Main", command=self._pom_write).grid(
             row=1, column=4, padx=4, pady=(2, 6), sticky="w")
+        self.pom_cv_name = tk.StringVar()
+        ttk.Label(pom, textvariable=self.pom_cv_name, foreground="#888").grid(
+            row=1, column=5, sticky="w", padx=6)
+        self.pom_cv.trace_add("write", lambda *_: self._cv_name_changed(
+            self.pom_cv, self.pom_cv_name))
 
         # --- Console --------------------------------------------------------
         console = ttk.LabelFrame(self, text="Console")
@@ -723,10 +773,27 @@ class ThrottleApp(tk.Tk):
         if addr is not None and self.send_cmd(f"<W {addr}>"):
             self.prog_result.set("writing address...")
 
+    @staticmethod
+    def _cv_desc(cv):
+        """'CV 3 (Acceleration rate)', or plain 'CV 3' for a nameless one."""
+        try:
+            name = cv_name(int(cv))
+        except (TypeError, ValueError):
+            name = None
+        return f"CV {cv} ({name})" if name else f"CV {cv}"
+
+    def _cv_name_changed(self, var, out):
+        """Live lookup label beside a CV entry (traced on its StringVar)."""
+        try:
+            name = cv_name(int(var.get().strip()))
+        except ValueError:
+            name = None
+        out.set(name or "")
+
     def _read_cv(self):
         cv = self._prog_int(self.prog_cv, 1, 1024, "CV")
         if cv is not None and self.send_cmd(f"<R {cv}>"):
-            self.prog_result.set(f"reading CV {cv}...")
+            self.prog_result.set(f"reading {self._cv_desc(cv)}...")
 
     def _write_cv(self):
         cv = self._prog_int(self.prog_cv, 1, 1024, "CV")
@@ -734,7 +801,7 @@ class ThrottleApp(tk.Tk):
             return
         val = self._prog_int(self.prog_val, 0, 255, "value")
         if val is not None and self.send_cmd(f"<W {cv} {val}>"):
-            self.prog_result.set(f"writing CV {cv}...")
+            self.prog_result.set(f"writing {self._cv_desc(cv)}...")
 
     def _pom_write(self):
         cv = self._prog_int(self.pom_cv, 1, 1024, "CV")
@@ -837,9 +904,9 @@ class ThrottleApp(tk.Tk):
         elif head == "v" and len(parts) >= 3:
             cv, value = parts[1], parts[2]
             if value == "-1":
-                self.prog_result.set(f"CV {cv} read FAILED")
+                self.prog_result.set(f"{self._cv_desc(cv)} read FAILED")
             else:
-                self.prog_result.set(f"CV {cv} = {value}")
+                self.prog_result.set(f"{self._cv_desc(cv)} = {value}")
                 self.prog_val.set(value)   # prime for a read-modify-write
                 if cv == "29" and value.isdigit():
                     self._cv29_sync(int(value))
@@ -848,8 +915,9 @@ class ThrottleApp(tk.Tk):
         elif head == "r":
             if len(parts) >= 3:
                 cv, value = parts[1], parts[2]
-                self.prog_result.set(f"CV {cv} write FAILED" if value == "-1"
-                                     else f"CV {cv} written: {value}")
+                self.prog_result.set(
+                    f"{self._cv_desc(cv)} write FAILED" if value == "-1"
+                    else f"{self._cv_desc(cv)} written: {value}")
                 if cv == "29" and value.isdigit():
                     self._cv29_sync(int(value))
             elif len(parts) == 2:

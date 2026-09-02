@@ -309,6 +309,12 @@ window size.
 - POM ("Write on Main") targets the loco selected on the **Run** tab
   (`self.cab`), read at click time. It gets no reply by design — the label
   says to watch the loco.
+- CV entries have a live name lookup: `CV_NAMES` (common NMRA S-9.2.2 CVs)
+  plus range rules in `cv_name()` (33-46 function mapping, 67-94 speed table,
+  112-256 manufacturer-specific). A grey label beside each CV entry updates
+  via `trace_add` on the StringVar, and `_cv_desc()` weaves the name into
+  the result line ("CV 3 (Acceleration rate) = 24"). Unknown CVs show
+  nothing — no guessing.
 - The CV29 bit editor exposes bits 0-5 as checkboxes; toggling only updates
   the preview label ("(not written)") — nothing is sent until Write CV29.
   **Bits 6-7 are not editable but are preserved** (`self.cv29_high`, taken
@@ -350,11 +356,10 @@ window size.
    `<- cab>` frees them.
 2. Consist support — use the **CSConsist** command-station consists, not the
    deprecated in-throttle consists.
-3. Programming tab polish: a CV name lookup table (1/2/3/4/5/6/17/18/29...)
-   and long-address read/write helpers built on CV17/18. Basic
-   read/write/POM plumbing, reply parsing and the CV29 bit editor exist;
-   `<V cv value>` verify-with-guess reads would speed up slow service-mode
-   reads.
+3. Programming tab polish: long-address read/write helpers built on CV17/18.
+   Basic read/write/POM plumbing, reply parsing, the CV29 bit editor and the
+   CV name lookup exist; `<V cv value>` verify-with-guess reads would speed
+   up slow service-mode reads.
 4. Turnout/accessory panel driven by `<JT>` discovery.
 5. Auto-reconnect with backoff; currently a dropped link just reports and stops.
 6. mDNS/bonjour discovery of the command station instead of a typed IP.

@@ -67,7 +67,9 @@ Gotchas the reference spells out:
   deprecated `<f cab byte1 byte2>` form. But `functMap` in the `<l>` broadcast
   is only 32 bits, so **F0-F31 is the practical ceiling** for anything that
   needs to stay in sync. The app exposes exactly that (`MAX_FUNCTION = 31`,
-  32 checkboxes in a 6x6 grid). Going past F31 means accepting write-only
+  a 6x6 grid: 30 latching checkboxes plus momentary whistle buttons for
+  F3/F4 — `MOMENTARY_FUNCS` — which send `<F 1>` on press, `<F 0>` on
+  release). Going past F31 means accepting write-only
   functions that no broadcast can ever correct.
 - Functions are transmitted in NMRA groups. The station remembers previous
   settings within a group, but *"if you have never set F2, then changing F1

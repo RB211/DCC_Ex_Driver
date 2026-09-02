@@ -43,6 +43,7 @@ except ImportError:
 HAVE_SERIAL = serial is not None
 
 MAX_FUNCTION = 31             # functMap in <l> is 32 bits, so F0-F31 round-trips
+MOMENTARY_FUNCS = {3, 4}      # whistles: on while the button is held, off on release
 MAX_SPEED = 126
 SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
 CURRENT_POLL_MS = 1000        # how often to ask the station for track current
@@ -304,9 +305,17 @@ class ThrottleApp(tk.Tk):
             var = tk.IntVar(value=0)
             self.func_vars[n] = var
             label = "F0 (Lights)" if n == 0 else f"F{n}"
-            cb = ttk.Checkbutton(funcs, text=label, variable=var,
-                                 command=lambda k=n: self._func_toggled(k))
-            cb.grid(row=n // cols, column=n % cols, sticky="w", padx=8, pady=3)
+            if n in MOMENTARY_FUNCS:
+                # Momentary: <F 1> on press, <F 0> on release. No variable --
+                # the widget's pressed look is the feedback, and func_vars[n]
+                # still tracks the real state via the <l> broadcast.
+                w = ttk.Button(funcs, text=f"{label} (Whistle)")
+                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
+                w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
+            else:
+                w = ttk.Checkbutton(funcs, text=label, variable=var,
+                                    command=lambda k=n: self._func_toggled(k))
+            w.grid(row=n // cols, column=n % cols, sticky="w", padx=8, pady=3)
         ttk.Button(funcs, text="All Functions Off", command=self._all_funcs_off).grid(
             row=(MAX_FUNCTION // cols) + 1, column=0, columnspan=2,
             sticky="w", padx=8, pady=(4, 6))
@@ -559,6 +568,12 @@ class ThrottleApp(tk.Tk):
         var = self.func_vars[n]
         if not self.send_cmd(f"<F {self.cab.get()} {n} {var.get()}>"):
             self._set_quiet(var, 1 - var.get())    # undo the click Tk already applied
+
+    def _func_momentary(self, n, state):
+        """Press/release for MOMENTARY_FUNCS. Nothing to revert on a failed
+        send: the button has no latched state, and a release lost with the
+        link leaves func_vars[n] to be corrected by the next <l> broadcast."""
+        self.send_cmd(f"<F {self.cab.get()} {n} {state}>")
 
     def _all_funcs_off(self):
         for n, var in self.func_vars.items():

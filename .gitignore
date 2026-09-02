@@ -13,3 +13,8 @@ __pycache__/
 # build.sh output — regenerate with the toolchain, don't track
 Documents/out/
 Documents/parts/
+
+# PyInstaller output — rebuild with: .venv/bin/pyinstaller --onefile --windowed --name dccex-throttle dccex_throttle.py
+build/
+dist/
+*.spec

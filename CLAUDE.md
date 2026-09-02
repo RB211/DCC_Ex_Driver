@@ -181,6 +181,13 @@ correctly — same code at the right proportions. Tk version is the thing that
 matters here, not the Python version, so check
 `tkinter.Tcl().call('info', 'patchlevel')` before blaming layout code.
 
+UI metrics are keyed off `tk windowingsystem` (`aqua` vs `x11`) in
+`_build_ui`, not off the OS: x11 gets the 16 pt fonts, the 880x45 slider and
+the `uniform="band"` row group; aqua gets 13 pt (its native widget size), the
+stock slider, and **no** uniform group — uniform makes rows 1 and 2 *request*
+the taller row's height, which pushed the requested window (1307x1365) past a
+MacBook screen. A tiling WM imposes the window size so x11 never notices.
+
 `.vscode/settings.json` pins the interpreter to
 `${workspaceFolder}/.venv/bin/python`.
 Without it VS Code picks a bare Homebrew python3 that has no pyserial,

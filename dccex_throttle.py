@@ -250,21 +250,32 @@ class ThrottleApp(tk.Tk):
         # labels, entries, buttons, tabs, radios, checks -- so nothing can
         # mismatch. Buttons are kept compact with tight padding, never with
         # a smaller font.
+        #
+        # The sizes are per windowing system, not per OS: aqua's native
+        # widgets are drawn for 13 pt, and the x11 numbers (16 pt fonts,
+        # 880 px slider) push the requested window height past a MacBook
+        # screen -- Tk then crushes the weighted bands to fit.
+        aqua = self.tk.call("tk", "windowingsystem") == "aqua"
+        base = 13 if aqua else 16
         for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
-            tkfont.nametofont(name).configure(size=16)
-        tkfont.nametofont("TkFixedFont").configure(size=13)   # console log
+            tkfont.nametofont(name).configure(size=base)
+        tkfont.nametofont("TkFixedFont").configure(size=11 if aqua else 13)
         style = ttk.Style(self)
         style.configure("TButton", padding=(6, 3))
-        style.configure("Func.TButton", font=("TkDefaultFont", 16, "bold"),
+        style.configure("Func.TButton", font=("TkDefaultFont", base, "bold"),
                         padding=(8, 6))
-        style.configure("Stop.TButton", font=("TkDefaultFont", 16, "bold"),
+        style.configure("Stop.TButton", font=("TkDefaultFont", base, "bold"),
                         padding=(8, 4))
 
         # Vertical bands: row 0 (connection + track power) hugs its content;
         # rows 1 (tabs) and 2 (console) split the remaining space equally.
+        # The uniform group is x11-only: uniform makes both rows *request*
+        # the taller row's height, so the window asks for tabs+tabs, not
+        # tabs+console. A tiling WM imposes the size anyway, but macOS
+        # honours the request and the window overflows the screen.
         self.grid_columnconfigure(0, weight=1)
         for r in (1, 2):
-            self.grid_rowconfigure(r, weight=1, uniform="band")
+            self.grid_rowconfigure(r, weight=1, uniform="" if aqua else "band")
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="new", padx=6, pady=(4, 0))
 
@@ -368,7 +379,7 @@ class ThrottleApp(tk.Tk):
         # tk.Button, not ttk -- the colour is the state indicator.
         self.dir_btn = tk.Button(loco, width=16, fg="white",
                                  activeforeground="white",
-                                 font=("TkDefaultFont", 16, "bold"),
+                                 font=("TkDefaultFont", base, "bold"),
                                  command=self._dir_toggled)
         self.dir_btn.grid(row=0, column=2, columnspan=2, padx=(18, 4), pady=4,
                           sticky="ew")
@@ -378,14 +389,19 @@ class ThrottleApp(tk.Tk):
                    command=self._stop).grid(row=0, column=4, padx=(18, 4))
         estop = tk.Button(loco, text="E-STOP ALL", width=12, bg="#c62828", fg="white",
                           activebackground="#e53935", activeforeground="white",
-                          font=("TkDefaultFont", 16, "bold"),
+                          font=("TkDefaultFont", base, "bold"),
                           command=self._estop_all)
         estop.grid(row=0, column=5, padx=4, pady=4)
 
         self.speed = tk.IntVar(value=0)
+        # Aqua draws its native slider (width/sliderlength are ignored) and
+        # 880 px would set the whole window's width; the fat 45/70 knob is
+        # x11-only touch tuning.
         self.scale = tk.Scale(loco, from_=0, to=MAX_SPEED, orient="horizontal",
-                              variable=self.speed, length=880, tickinterval=21,
-                              width=45, sliderlength=70,
+                              variable=self.speed, tickinterval=21,
+                              length=640 if aqua else 880,
+                              width=15 if aqua else 45,
+                              sliderlength=30 if aqua else 70,
                               resolution=1, command=self._speed_moved)
         self.scale.grid(row=1, column=0, columnspan=6, padx=10, pady=(0, 8), sticky="ew")
         loco.columnconfigure(5, weight=1)

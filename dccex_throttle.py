@@ -12,18 +12,31 @@ The command station auto-selects native vs WiThrottle protocol based on the
 first command it receives, so this client sends <s> immediately on connect to
 lock it into native mode and pull the version/status.
 
+The UI is two tabs -- Run (throttle + functions) and Programming (service-mode
+and POM CV access) -- with connection, track power and the console shared
+above/below the tabs.
+
 Commands used:
   <s>                     status / version
   <1> <0> <1 MAIN> ...    track power
+  <t cab>                 request a state re-broadcast (<l ...>) for one loco
   <t cab speed dir>       throttle   speed 0-126, -1 = estop, dir 1=fwd 0=rev
-  <F cab func state>      function   func 0-68 protocol, 0-31 exposed here
-                                     (functMap in <l> is 32 bits), state 1/0
+  <F cab func state>      function   func 0-68 protocol; F1-F8 exposed here as
+                                     momentary buttons (1 on press, 0 on release)
   <!>                     emergency stop everything
+  <c>                     track current, polled 1/s while connected
+  <R> <R cv>              prog track: read loco address / read CV
+  <W addr> <W cv val>     prog track: write loco address / write CV
+  <w cab cv val>          write CV on main (POM), no reply
 
-Broadcasts parsed:
+Messages parsed:
   <l cab reg speedByte functMap>   loco state (from any throttle on the layout)
-  <p0> <p1> <p1 MAIN>              power state
+  <p0> <p1> <p1 MAIN>              power state (<p2> = overload)
+  <c "CurrentMAIN" ...>            track current reply
   <iDCC-EX V-...>                  version banner
+  <v cv value>                     CV read result (-1 = failed)
+  <r cv value> / <r address>       CV write ack / address read result
+  <w cab>                          address write ack (-1 = failed)
 """
 
 import queue
@@ -32,6 +45,7 @@ import socket
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
 try:
@@ -42,8 +56,7 @@ except ImportError:
     list_ports = None
 HAVE_SERIAL = serial is not None
 
-MAX_FUNCTION = 31             # functMap in <l> is 32 bits, so F0-F31 round-trips
-MOMENTARY_FUNCS = {3, 4}      # whistles: on while the button is held, off on release
+FUNCTIONS = range(1, 9)       # F1-F8, all momentary: on while held, off on release
 MAX_SPEED = 126
 SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
 CURRENT_POLL_MS = 1000        # how often to ask the station for track current
@@ -191,9 +204,31 @@ class ThrottleApp(tk.Tk):
 
     # ---------------- UI construction ----------------
     def _build_ui(self):
+        # ONE text size everywhere. The named fonts carry every widget --
+        # labels, entries, buttons, tabs, radios, checks -- so nothing can
+        # mismatch. Buttons are kept compact with tight padding, never with
+        # a smaller font.
+        for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
+            tkfont.nametofont(name).configure(size=16)
+        tkfont.nametofont("TkFixedFont").configure(size=13)   # console log
+        style = ttk.Style(self)
+        style.configure("TButton", padding=(6, 3))
+        style.configure("Func.TButton", font=("TkDefaultFont", 16, "bold"),
+                        padding=(8, 6))
+        style.configure("Stop.TButton", font=("TkDefaultFont", 16, "bold"),
+                        padding=(8, 4))
+
+        # Vertical bands: row 0 (connection + track power) hugs its content;
+        # rows 1 (tabs) and 2 (console) split the remaining space equally.
+        self.grid_columnconfigure(0, weight=1)
+        for r in (1, 2):
+            self.grid_rowconfigure(r, weight=1, uniform="band")
+        top = ttk.Frame(self)
+        top.grid(row=0, column=0, sticky="new", padx=6, pady=(4, 0))
+
         # --- Connection -------------------------------------------------
-        conn = ttk.LabelFrame(self, text="Connection")
-        conn.pack(fill="x", padx=6, pady=4)
+        conn = ttk.LabelFrame(top, text="Connection")
+        conn.pack(fill="x", pady=(0, 4))
 
         self.mode = tk.StringVar(value="tcp")
         ttk.Radiobutton(conn, text="TCP", variable=self.mode, value="tcp",
@@ -228,22 +263,22 @@ class ThrottleApp(tk.Tk):
         self._mode_changed()
 
         # --- Track power ------------------------------------------------
-        power = ttk.LabelFrame(self, text="Track Power")
-        power.pack(fill="x", padx=6, pady=4)
+        power = ttk.LabelFrame(top, text="Track Power")
+        power.pack(fill="x")
         for i, (label, cmd) in enumerate([
             ("ALL ON", "<1>"), ("ALL OFF", "<0>"),
             ("MAIN ON", "<1 MAIN>"), ("MAIN OFF", "<0 MAIN>"),
             ("PROG ON", "<1 PROG>"), ("PROG OFF", "<0 PROG>"),
         ]):
-            ttk.Button(power, text=label, width=10,
+            ttk.Button(power, text=label, width=9,
                        command=lambda c=cmd: self.send_cmd(c)).grid(row=0, column=i, padx=3, pady=5)
         self.power_state = tk.StringVar(value="power: unknown")
         ttk.Label(power, textvariable=self.power_state).grid(
             row=0, column=6, padx=12, sticky="w")
 
         # --- Current draw ---------------------------------------------------
-        ttk.Label(power, text="Current:").grid(row=1, column=0, padx=(6, 2),
-                                               pady=(0, 6), sticky="e")
+        ttk.Label(power, text="Current:").grid(
+            row=1, column=0, padx=(6, 2), pady=(0, 6), sticky="e")
         self.current_bar = ttk.Progressbar(power, orient="horizontal",
                                            mode="determinate", length=300)
         self.current_bar.grid(row=1, column=1, columnspan=4, pady=(0, 6),
@@ -263,8 +298,18 @@ class ThrottleApp(tk.Tk):
             row=1, column=7, padx=(0, 8), pady=(0, 6), sticky="w")
         self._refresh_current()
 
+        # --- Tabs: Run / Programming -------------------------------------
+        # Connection, track power and the console stay global; everything
+        # loco-specific lives on one of the two tabs.
+        nb = ttk.Notebook(self)
+        nb.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
+        run_tab = ttk.Frame(nb)
+        prog_tab = ttk.Frame(nb)
+        nb.add(run_tab, text="Run")
+        nb.add(prog_tab, text="Programming")
+
         # --- Loco / throttle ---------------------------------------------
-        loco = ttk.LabelFrame(self, text="Locomotive")
+        loco = ttk.LabelFrame(run_tab, text="Locomotive")
         loco.pack(fill="x", padx=6, pady=4)
 
         ttk.Label(loco, text="Address:").grid(row=0, column=0, padx=(6, 2), pady=6, sticky="e")
@@ -282,49 +327,102 @@ class ThrottleApp(tk.Tk):
         ttk.Radiobutton(loco, text="Reverse", variable=self.direction, value=0,
                         command=self._dir_changed).grid(row=0, column=3, padx=4)
 
-        ttk.Button(loco, text="STOP", width=10,
+        ttk.Button(loco, text="STOP", width=10, style="Stop.TButton",
                    command=self._stop).grid(row=0, column=4, padx=(18, 4))
         estop = tk.Button(loco, text="E-STOP ALL", width=12, bg="#c62828", fg="white",
                           activebackground="#e53935", activeforeground="white",
+                          font=("TkDefaultFont", 16, "bold"),
                           command=self._estop_all)
-        estop.grid(row=0, column=5, padx=4)
+        estop.grid(row=0, column=5, padx=4, pady=4)
 
         self.speed = tk.IntVar(value=0)
         self.scale = tk.Scale(loco, from_=0, to=MAX_SPEED, orient="horizontal",
-                              variable=self.speed, length=640, tickinterval=21,
+                              variable=self.speed, length=880, tickinterval=21,
+                              width=45, sliderlength=70,
                               resolution=1, command=self._speed_moved)
         self.scale.grid(row=1, column=0, columnspan=6, padx=10, pady=(0, 8), sticky="ew")
         loco.columnconfigure(5, weight=1)
 
         # --- Functions -----------------------------------------------------
-        funcs = ttk.LabelFrame(self, text="Functions")
-        funcs.pack(fill="x", padx=6, pady=4)
+        funcs = ttk.LabelFrame(run_tab, text="Functions")
+        funcs.pack(fill="both", expand=True, padx=6, pady=4)
         self.func_vars = {}
-        cols = 6
-        for n in range(0, MAX_FUNCTION + 1):
+        cols = 4
+        for i, n in enumerate(FUNCTIONS):
+            # All momentary: <F 1> on press, <F 0> on release. No variable --
+            # the widget's pressed look is the feedback, and func_vars[n]
+            # still tracks the real state via the <l> broadcast.
             var = tk.IntVar(value=0)
             self.func_vars[n] = var
-            label = "F0 (Lights)" if n == 0 else f"F{n}"
-            if n in MOMENTARY_FUNCS:
-                # Momentary: <F 1> on press, <F 0> on release. No variable --
-                # the widget's pressed look is the feedback, and func_vars[n]
-                # still tracks the real state via the <l> broadcast.
-                w = ttk.Button(funcs, text=f"{label} (Whistle)")
-                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
-                w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
-            else:
-                w = ttk.Checkbutton(funcs, text=label, variable=var,
-                                    command=lambda k=n: self._func_toggled(k))
-            w.grid(row=n // cols, column=n % cols, sticky="w", padx=8, pady=3)
+            w = ttk.Button(funcs, text=f"F{n}", style="Func.TButton")
+            w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
+            w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
+            w.grid(row=i // cols, column=i % cols, sticky="nsew", padx=6, pady=5)
+        func_rows = (len(FUNCTIONS) + cols - 1) // cols
+        for c in range(cols):
+            funcs.columnconfigure(c, weight=1)
+        for r in range(func_rows):
+            funcs.rowconfigure(r, weight=1)
         ttk.Button(funcs, text="All Functions Off", command=self._all_funcs_off).grid(
-            row=(MAX_FUNCTION // cols) + 1, column=0, columnspan=2,
-            sticky="w", padx=8, pady=(4, 6))
+            row=func_rows, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 6))
+
+        # --- Programming tab ------------------------------------------------
+        svc = ttk.LabelFrame(prog_tab, text="Programming Track (service mode)")
+        svc.pack(fill="x", padx=6, pady=4)
+        ttk.Label(svc, text="Loco must be alone on the PROG track. "
+                            "Locos do not move in service mode.").grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=6, pady=(4, 2))
+
+        ttk.Button(svc, text="Read Address", command=self._read_address).grid(
+            row=1, column=0, padx=6, pady=4, sticky="w")
+        ttk.Label(svc, text="Address:").grid(row=1, column=1, sticky="e")
+        self.prog_addr = tk.StringVar()
+        ttk.Entry(svc, textvariable=self.prog_addr, width=7).grid(
+            row=1, column=2, sticky="w", padx=(2, 6))
+        ttk.Button(svc, text="Write Address", command=self._write_address).grid(
+            row=1, column=3, padx=4, pady=4, sticky="w")
+
+        ttk.Label(svc, text="CV:").grid(row=2, column=0, sticky="e", padx=(6, 0))
+        self.prog_cv = tk.StringVar()
+        ttk.Entry(svc, textvariable=self.prog_cv, width=6).grid(
+            row=2, column=1, sticky="w", padx=(2, 6), columnspan=2)
+        ttk.Label(svc, text="Value:").grid(row=2, column=2, sticky="e")
+        self.prog_val = tk.StringVar()
+        ttk.Entry(svc, textvariable=self.prog_val, width=5).grid(
+            row=2, column=3, sticky="w", padx=(2, 6))
+        ttk.Button(svc, text="Read CV", command=self._read_cv).grid(
+            row=2, column=4, padx=4, pady=4)
+        ttk.Button(svc, text="Write CV", command=self._write_cv).grid(
+            row=2, column=5, padx=4, pady=4)
+
+        self.prog_result = tk.StringVar(value="result: --")
+        ttk.Label(svc, textvariable=self.prog_result).grid(
+            row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(2, 6))
+
+        pom = ttk.LabelFrame(prog_tab, text="Program on Main (POM)")
+        pom.pack(fill="x", padx=6, pady=4)
+        ttk.Label(pom, text="Writes to the loco selected on the Run tab. "
+                            "No reply from the station -- watch the loco.").grid(
+            row=0, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 2))
+        ttk.Label(pom, text="CV:").grid(row=1, column=0, sticky="e", padx=(6, 0))
+        self.pom_cv = tk.StringVar()
+        ttk.Entry(pom, textvariable=self.pom_cv, width=6).grid(
+            row=1, column=1, sticky="w", padx=(2, 6))
+        ttk.Label(pom, text="Value:").grid(row=1, column=2, sticky="e")
+        self.pom_val = tk.StringVar()
+        ttk.Entry(pom, textvariable=self.pom_val, width=5).grid(
+            row=1, column=3, sticky="w", padx=(2, 6))
+        ttk.Button(pom, text="Write on Main", command=self._pom_write).grid(
+            row=1, column=4, padx=4, pady=(2, 6), sticky="w")
 
         # --- Console --------------------------------------------------------
         console = ttk.LabelFrame(self, text="Console")
-        console.pack(fill="both", expand=True, padx=6, pady=4)
-        self.log = tk.Text(console, height=10, wrap="none", state="disabled",
-                           font=("Menlo", 11), background="#101418", foreground="#d8dee9")
+        console.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 4))
+        # height=5 is only the minimum -- the console's third of the window
+        # is what actually sizes it. TkFixedFont, not "Menlo": Menlo only
+        # exists on macOS and silently falls back on Linux.
+        self.log = tk.Text(console, height=5, wrap="none", state="disabled",
+                           font="TkFixedFont", background="#101418", foreground="#d8dee9")
         self.log.pack(side="top", fill="both", expand=True, padx=4, pady=4)
         self.log.tag_config("tx", foreground="#88c0d0")
         self.log.tag_config("rx", foreground="#a3be8c")
@@ -562,17 +660,11 @@ class ThrottleApp(tk.Tk):
         self.pending_speed = None
         self.last_state = (0, self.direction.get())
 
-    def _func_toggled(self, n):
-        if self.syncing:
-            return
-        var = self.func_vars[n]
-        if not self.send_cmd(f"<F {self.cab.get()} {n} {var.get()}>"):
-            self._set_quiet(var, 1 - var.get())    # undo the click Tk already applied
-
     def _func_momentary(self, n, state):
-        """Press/release for MOMENTARY_FUNCS. Nothing to revert on a failed
-        send: the button has no latched state, and a release lost with the
-        link leaves func_vars[n] to be corrected by the next <l> broadcast."""
+        """Press/release for the momentary function buttons. Nothing to revert
+        on a failed send: the button has no latched state, and a release lost
+        with the link leaves func_vars[n] to be corrected by the next <l>
+        broadcast."""
         self.send_cmd(f"<F {self.cab.get()} {n} {state}>")
 
     def _all_funcs_off(self):
@@ -582,6 +674,48 @@ class ThrottleApp(tk.Tk):
             if not self.send_cmd(f"<F {self.cab.get()} {n} 0>"):
                 return          # link is down; leave the rest showing their real state
             self._set_quiet(var, 0)
+
+    # ---------------- programming ----------------
+    def _prog_int(self, var, lo, hi, name):
+        """Parse an entry as an int in [lo, hi]; log and return None if not."""
+        try:
+            val = int(var.get().strip())
+            if not lo <= val <= hi:
+                raise ValueError
+        except ValueError:
+            self._log(f"{name} must be {lo}-{hi}", "err")
+            return None
+        return val
+
+    def _read_address(self):
+        if self.send_cmd("<R>"):
+            self.prog_result.set("reading address...")
+
+    def _write_address(self):
+        addr = self._prog_int(self.prog_addr, 1, 10293, "address")
+        if addr is not None and self.send_cmd(f"<W {addr}>"):
+            self.prog_result.set("writing address...")
+
+    def _read_cv(self):
+        cv = self._prog_int(self.prog_cv, 1, 1024, "CV")
+        if cv is not None and self.send_cmd(f"<R {cv}>"):
+            self.prog_result.set(f"reading CV {cv}...")
+
+    def _write_cv(self):
+        cv = self._prog_int(self.prog_cv, 1, 1024, "CV")
+        if cv is None:
+            return
+        val = self._prog_int(self.prog_val, 0, 255, "value")
+        if val is not None and self.send_cmd(f"<W {cv} {val}>"):
+            self.prog_result.set(f"writing CV {cv}...")
+
+    def _pom_write(self):
+        cv = self._prog_int(self.pom_cv, 1, 1024, "CV")
+        if cv is None:
+            return
+        val = self._prog_int(self.pom_val, 0, 255, "value")
+        if val is not None:
+            self.send_cmd(f"<w {self.cab.get()} {cv} {val}>")
 
     # ---------------- inbound ----------------
     def _pump(self):
@@ -639,6 +773,35 @@ class ThrottleApp(tk.Tk):
             # p2 latches the overload colour; any later p0/p1 is the all-clear.
             self.overload = head[1] == "2"
             self._refresh_current()
+
+        # <v cv value> -- CV read result from the prog track, -1 = failed
+        elif head == "v" and len(parts) >= 3:
+            cv, value = parts[1], parts[2]
+            if value == "-1":
+                self.prog_result.set(f"CV {cv} read FAILED")
+            else:
+                self.prog_result.set(f"CV {cv} = {value}")
+                self.prog_val.set(value)   # prime for a read-modify-write
+
+        # <r cv value> -- CV write ack; <r address> -- address read result
+        elif head == "r":
+            if len(parts) >= 3:
+                cv, value = parts[1], parts[2]
+                self.prog_result.set(f"CV {cv} write FAILED" if value == "-1"
+                                     else f"CV {cv} written: {value}")
+            elif len(parts) == 2:
+                addr = parts[1]
+                if addr == "-1":
+                    self.prog_result.set("address read FAILED")
+                else:
+                    self.prog_result.set(f"loco address = {addr}")
+                    self.prog_addr.set(addr)
+
+        # <w cab> -- address write ack (the POM <w cab cv val> has no reply)
+        elif head == "w" and len(parts) == 2:
+            addr = parts[1]
+            self.prog_result.set("address write FAILED" if addr == "-1"
+                                 else f"address written: {addr}")
 
         # <iDCC-EX V-5.x.x ...>
         elif head.startswith("i"):

@@ -23,7 +23,9 @@ local and open.
 | USB | USB-C, serial console at **115200 baud** |
 | Network | Native command port **2560**. Ships in AP mode: SSID `DCCEX_xxxxxx`, password `PASS_xxxxxx`, gateway `192.168.4.1`. Can be flipped to STA mode with EX-Installer. |
 
-Owner's dev machine: Apple Silicon MacBook Pro. Home network is UniFi.
+Owner's dev machines: an Apple Silicon MacBook Pro and an Arch Linux desktop
+(Hyprland/Omarchy). Home network is UniFi. See §4 *Environment* for the
+per-machine Python/Tk situation.
 
 ## 3. Protocol facts that matter
 
@@ -56,6 +58,11 @@ Owner's dev machine: Apple Silicon MacBook Pro. Home network is UniFi.
 <F cab func state>        function. func 0-68, state 1/0
 <!>                       emergency stop ALL locos
 <c>                       track current -> <c "CurrentMAIN" ...>. Polled 1/s
+<R>                       read loco address on prog track -> <r address>
+<R cv>                    read CV on prog track -> <v cv value>
+<W addr>                  write loco address on prog track -> <w cab> / <w -1>
+<W cv val>                write CV on prog track -> <r cv value>
+<w cab cv val>            POM write on main. No reply at all
 ```
 
 Gotchas the reference spells out:
@@ -66,10 +73,12 @@ Gotchas the reference spells out:
 - `<F>` accepts func **0-68** (RCN-212). The old 0-28 limit belongs to the
   deprecated `<f cab byte1 byte2>` form. But `functMap` in the `<l>` broadcast
   is only 32 bits, so **F0-F31 is the practical ceiling** for anything that
-  needs to stay in sync. The app exposes exactly that (`MAX_FUNCTION = 31`,
-  a 6x6 grid: 30 latching checkboxes plus momentary whistle buttons for
-  F3/F4 — `MOMENTARY_FUNCS` — which send `<F 1>` on press, `<F 0>` on
-  release). Going past F31 means accepting write-only
+  needs to stay in sync. The app currently exposes **F1-F8 only**
+  (`FUNCTIONS = range(1, 9)`), every one of them momentary: plain
+  `ttk.Button`s with press/release bindings that send `<F 1>` / `<F 0>`
+  (`_func_momentary`). There is no latched widget state to revert on a failed
+  send; `func_vars` mirrors the true state from `<l>` broadcasts, and it is
+  what `_all_funcs_off` consults. Going past F31 means accepting write-only
   functions that no broadcast can ever correct.
 - Functions are transmitted in NMRA groups. The station remembers previous
   settings within a group, but *"if you have never set F2, then changing F1
@@ -78,8 +87,6 @@ Gotchas the reference spells out:
 ### Commands not yet wired into the GUI
 
 ```
-<R cv> <W cv val>         read / write CV on prog track
-<w cab cv val>            POM write on main
 <T id 1|0>                turnout throw / close
 <JA> <JR> <JT>            roster / turnout / route lists (v4.2+)
 <= A DCC>                 TrackManager: set track mode (DCC/DC/PROG/AUTO)
@@ -119,12 +126,22 @@ Offline copy with more detail: `Documents/dccex-native-protocol.md` (see §6).
   are exactly `current, max, trip` in order, and the short `<c current>` form
   some builds emit still parses.
 - `<iDCC-EX V-...>` — version banner.
+- `<v cv value>` — prog-track CV read result (reply to `<R cv>`); value -1 =
+  failed. A good read also primes the Programming tab's Value entry for
+  read-modify-write.
+- `<r cv value>` / `<r address>` — prog-track CV write ack / address read
+  result (-1 = failed). Same opcode, disambiguated **purely by argument
+  count** (2 vs 1); a good address read fills the Address entry. The legacy
+  pipe-delimited `<r callbacknum|callbacksub|cv value>` form only answers the
+  deprecated commands, which the app never sends.
+- `<w cab>` — address write ack (reply to `<W addr>`, -1 = failed). Only the
+  one-argument form is treated as an ack, so nothing collides with the
+  reply-less POM `<w cab cv val>` command.
 
 Not yet parsed, in rough order of usefulness:
 
 - `<H id [DCC|SERVO|VPIN|LCN] ... 0|1>` — turnout state. Arrives unprompted and
   as a burst after every `<s>`.
-- `<r address>` — loco address read on the prog track.
 - `<q id>` / `<Q id>` — sensor deactivated / activated.
 - `<m "text">` — EXRAIL message to all throttles (5.4.0+).
 - `<i id position moving>` — turntable/traverser state (5.4.0+).
@@ -138,14 +155,15 @@ Single file, `dccex_throttle.py`. **Stdlib only** — `pyserial` is the sole
 third-party import, and an optional one at that (the Serial radio button
 disables itself if it's absent).
 
-### Environment — use the venv
+### Environment — per machine
+
+**macOS (MacBook Pro):** run via the venv, and only the venv:
 
 ```
 .venv/bin/python dccex_throttle.py
 ```
 
-`.venv` is built on **Homebrew python3.14** and is the only supported way to
-run this. It is gitignored; recreate with:
+`.venv` is built on **Homebrew python3.14**. It is gitignored; recreate with:
 
 ```
 python3.14 -m venv .venv && .venv/bin/pip install pyserial
@@ -154,8 +172,8 @@ python3.14 -m venv .venv && .venv/bin/pip install pyserial
 **Do not run this on the pyenv 3.10.18 that used to be the default.** That
 build links against Apple's **Tcl/Tk 8.5.9**, which renders the GUI at the
 wrong scale on modern macOS. Homebrew 3.14.7 ships **Tk 9.0.4** and lays out
-correctly — same code, 960x803 instead of a cramped 858x789. Tk version is the
-thing that matters here, not the Python version, so check
+correctly — same code at the right proportions. Tk version is the thing that
+matters here, not the Python version, so check
 `tkinter.Tcl().call('info', 'patchlevel')` before blaming layout code.
 
 `.vscode/settings.json` pins the interpreter to
@@ -165,6 +183,19 @@ and Pylance reports three spurious *"Import 'serial' could not be resolved from
 source"* warnings. Both `.vscode/` and `.venv/` are gitignored — they hold
 machine-specific paths.
 
+**Arch Linux (Hyprland/Omarchy):** same entry point, its own gitignored
+`.venv`, built on the system `python3` (3.14.7, Tk 8.6.16) with pyserial
+installed; recreate with:
+
+```
+python3 -m venv .venv && .venv/bin/pip install pyserial
+```
+
+The system `python3` also runs the app (tkinter is present), just without
+serial support. Under the tiling WM the window is stretched to fill its tile,
+so judge layout by `winfo_reqwidth()`/`winfo_reqheight()`, never by actual
+window size.
+
 ### Structure
 
 - `BaseTransport` — owns a daemon reader thread. Accumulates bytes, extracts
@@ -173,7 +204,21 @@ machine-specific paths.
 - `TcpTransport` — `socket.create_connection`, 0.4 s recv timeout so the
   reader thread can notice the stop flag.
 - `SerialTransport` — pyserial, same contract.
-- `ThrottleApp(tk.Tk)` — all UI and state. Two `after()` loops:
+- `ThrottleApp(tk.Tk)` — all UI and state. The window is three vertical
+  bands on a root grid: (0) Connection + Track Power/Current, sized to hug
+  its content — no stretch, no filler whitespace; (1) a `ttk.Notebook` with
+  a **Run** tab (Locomotive + Functions) and a **Programming** tab
+  (service-mode address/CV read-write + POM write); (2) the Console. Rows 1
+  and 2 split the remaining height equally (`weight=1, uniform="band"`).
+  Connection, power and console are deliberately outside the notebook —
+  PROG power and the log matter on both tabs.
+  Font policy (owner requirement): **one text size everywhere — 16 pt via
+  the named fonts** (`TkDefaultFont`/`TkTextFont`/`TkHeadingFont`;
+  `TkFixedFont` 13 for the console log). Every widget inherits it: labels,
+  entries, buttons, tabs, radios, checks. Buttons are kept compact with
+  tight style *padding*, never with a smaller font — mixed text sizes are
+  exactly what the owner rejected. Func/Stop/E-STOP are the same 16 pt,
+  just bold. Don't set per-widget fonts. Two `after()` loops:
   - `_pump()` every 50 ms drains the RX queue into `_handle()`.
   - `_speed_tick()` every 30 ms flushes a pending slider value, rate-limited
     by `SEND_INTERVAL` (80 ms) so dragging doesn't flood the ESP32.
@@ -216,9 +261,11 @@ machine-specific paths.
   widget and then sends must revert it on False — otherwise the UI asserts a
   state the loco was never told about, and since a failed send also tears down
   the transport, no broadcast will ever arrive to correct it. `_set_quiet()`
-  does the revert under the `syncing` guard. Applies to `_func_toggled`,
-  `_all_funcs_off`, `_dir_changed`, `_stop` and `_estop_all`; the last two
+  does the revert under the `syncing` guard. Applies to `_all_funcs_off`,
+  `_dir_changed`, `_stop` and `_estop_all`; the last two
   also refuse to zero the slider or `last_state` on a failed send.
+  `_func_momentary` is exempt: the buttons latch nothing, so there is nothing
+  to revert — a release lost with the link is corrected by the next `<l>`.
 - **`_read_some()` has a three-way return** and each value means something
   different to `_read_loop`:
   - `bytes` — data, append to the buffer.
@@ -254,6 +301,13 @@ machine-specific paths.
 - Closing the window sends `<0>` to drop track power. Remove from
   `_on_close()` if unwanted.
 - The raw command box wraps bare input in angle brackets, so `D CABS` works.
+- Programming entries are validated client-side before anything hits the wire
+  (`_prog_int`: CV 1-1024, value 0-255, address 1-10293); a bad entry logs an
+  error and sends nothing. The result label shows "...ing" while a reply is
+  outstanding and is overwritten by the parsed `<v>`/`<r>`/`<w>` reply.
+- POM ("Write on Main") targets the loco selected on the **Run** tab
+  (`self.cab`), read at click time. It gets no reply by design — the label
+  says to watch the loco.
 
 ### Current display
 
@@ -286,8 +340,9 @@ machine-specific paths.
    `<- cab>` frees them.
 2. Consist support — use the **CSConsist** command-station consists, not the
    deprecated in-throttle consists.
-3. Programming track panel: `<R cv>`, `<W cv val>`, `<w cab cv val>`, with
-   result parsing and a CV name lookup table.
+3. Programming tab polish: a CV name lookup table (1/2/3/4/5/6/17/18/29...),
+   a CV29 bit editor, and long-address read/write helpers built on CV17/18.
+   The basic read/write/POM plumbing and reply parsing already exist.
 4. Turnout/accessory panel driven by `<JT>` discovery.
 5. Auto-reconnect with backoff; currently a dropped link just reports and stops.
 6. mDNS/bonjour discovery of the command station instead of a typed IP.

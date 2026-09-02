@@ -277,7 +277,7 @@ comparably recent distro — rebuild from source for older systems.
   state the loco was never told about, and since a failed send also tears down
   the transport, no broadcast will ever arrive to correct it. `_set_quiet()`
   does the revert under the `syncing` guard. Applies to `_all_funcs_off`,
-  `_dir_changed`, `_stop` and `_estop_all`; the last two
+  `_dir_toggled`, `_stop` and `_estop_all`; the last two
   also refuse to zero the slider or `last_state` on a failed send.
   `_func_momentary` is exempt: the buttons latch nothing, so there is nothing
   to revert — a release lost with the link is corrected by the next `<l>`.
@@ -316,6 +316,16 @@ comparably recent distro — rebuild from source for older systems.
 - Closing the window sends `<0>` to drop track power. Remove from
   `_on_close()` if unwanted.
 - The raw command box wraps bare input in angle brackets, so `D CABS` works.
+- Direction is a single colour-coded toggle (green "FORWARD" / orange
+  "REVERSE"), not radio buttons — an owner requirement. **Plain ASCII
+  labels only**: the U+25B6/25C0 arrows went through font fallback (Noto
+  Color Emoji renders them double-width on Linux), drawing far wider than
+  tkfont measures and clipping the label while every measurement said it
+  fit. Colour carries the state. Click flips it;
+  `_refresh_dir()` paints it, and must be called after every code path that
+  writes `self.direction` (`_dir_toggled`, `_cab_changed`, the `<l>`
+  handler). A failed send flips it back. tk.Button, not ttk, because the
+  background colour is the state indicator.
 - Programming entries are validated client-side before anything hits the wire
   (`_prog_int`: CV 1-1024, value 0-255, address 1-10293); a bad entry logs an
   error and sends nothing. The result label shows "...ing" while a reply is

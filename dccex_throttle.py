@@ -7,7 +7,7 @@ protocol directly to an EX-CommandStation (EX-CSB1 etc.) over TCP or USB serial.
 
   TCP    : default port 2560
   Serial : default 115200 baud (requires pyserial; optional)
-
+  
 The command station auto-selects native vs WiThrottle protocol based on the
 first command it receives, so this client sends <s> immediately on connect to
 lock it into native mode and pull the version/status.
@@ -363,10 +363,15 @@ class ThrottleApp(tk.Tk):
         spin.bind("<FocusOut>", self._cab_changed)
 
         self.direction = tk.IntVar(value=1)
-        ttk.Radiobutton(loco, text="Forward", variable=self.direction, value=1,
-                        command=self._dir_changed).grid(row=0, column=2, padx=(18, 4))
-        ttk.Radiobutton(loco, text="Reverse", variable=self.direction, value=0,
-                        command=self._dir_changed).grid(row=0, column=3, padx=4)
+        # One big toggle instead of radio buttons: click flips direction.
+        # tk.Button, not ttk -- the colour is the state indicator.
+        self.dir_btn = tk.Button(loco, width=16, fg="white",
+                                 activeforeground="white",
+                                 font=("TkDefaultFont", 16, "bold"),
+                                 command=self._dir_toggled)
+        self.dir_btn.grid(row=0, column=2, columnspan=2, padx=(18, 4), pady=4,
+                          sticky="ew")
+        self._refresh_dir()
 
         ttk.Button(loco, text="STOP", width=10, style="Stop.TButton",
                    command=self._stop).grid(row=0, column=4, padx=(18, 4))
@@ -641,11 +646,29 @@ class ThrottleApp(tk.Tk):
                 self.pending_speed = None
         self.after(30, self._speed_tick)
 
-    def _dir_changed(self):
-        if self.syncing:
-            return
-        if not self._send_throttle(self.speed.get(), self.direction.get()):
-            self._set_quiet(self.direction, 1 - self.direction.get())
+    def _refresh_dir(self):
+        """Paint the direction toggle from self.direction.
+
+        Plain ASCII on purpose: U+25B6/25C0 arrows go through font fallback
+        (often a double-width color-emoji glyph on Linux) and render far
+        wider than tkfont measures, clipping the label. Colour carries the
+        state; the text stays plain.
+        """
+        if self.direction.get() == 1:
+            self.dir_btn.configure(text="FORWARD", bg="#2e7d32",
+                                   activebackground="#388e3c")
+        else:
+            self.dir_btn.configure(text="REVERSE", bg="#ef6c00",
+                                   activebackground="#f57c00")
+
+    def _dir_toggled(self):
+        """The toggle flips direction; a failed send flips it back."""
+        new = 1 - self.direction.get()
+        self._set_quiet(self.direction, new)
+        self._refresh_dir()
+        if not self._send_throttle(self.speed.get(), new):
+            self._set_quiet(self.direction, 1 - new)
+            self._refresh_dir()
 
     def _cab_changed(self, *_):
         try:
@@ -661,6 +684,7 @@ class ThrottleApp(tk.Tk):
         for var in self.func_vars.values():
             var.set(0)
         self.syncing = False
+        self._refresh_dir()
         self.pending_speed = None
         self.last_state = (None, None)
         self._log(f"-- loco {cab} selected", "info")
@@ -884,6 +908,7 @@ class ThrottleApp(tk.Tk):
             for n, var in self.func_vars.items():
                 var.set(1 if func_map & (1 << n) else 0)
             self.syncing = False
+            self._refresh_dir()
             self.last_state = (speed, direction)
             self.pending_speed = None
 

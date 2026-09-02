@@ -196,6 +196,20 @@ serial support. Under the tiling WM the window is stretched to fill its tile,
 so judge layout by `winfo_reqwidth()`/`winfo_reqheight()`, never by actual
 window size.
 
+### Release packaging (Linux)
+
+One-file standalone binary via PyInstaller, published as a GitHub release
+(first: v0.1.0, asset `dccex-throttle-linux-x86_64`):
+
+```
+.venv/bin/pip install pyinstaller
+.venv/bin/pyinstaller --onefile --windowed --name dccex-throttle dccex_throttle.py
+```
+
+Output lands in `dist/` (gitignored along with `build/` and `*.spec`). The
+binary links the build machine's glibc, so an Arch-built one needs a
+comparably recent distro — rebuild from source for older systems.
+
 ### Structure
 
 - `BaseTransport` — owns a daemon reader thread. Accumulates bytes, extracts

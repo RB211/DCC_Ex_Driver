@@ -23,9 +23,8 @@ local and open.
 | USB | USB-C, serial console at **115200 baud** |
 | Network | Native command port **2560**. Ships in AP mode: SSID `DCCEX_xxxxxx`, password `PASS_xxxxxx`, gateway `192.168.4.1`. Can be flipped to STA mode with EX-Installer. |
 
-Owner's dev machines: an Apple Silicon MacBook Pro and an Arch Linux desktop
-(Hyprland/Omarchy). Home network is UniFi. See §4 *Environment* for the
-per-machine Python/Tk situation.
+Per-machine dev environment notes live in `CLAUDE.local.md` (gitignored);
+see §4 *Environment* for the rules that travel with the code.
 
 ## 3. Protocol facts that matter
 
@@ -167,53 +166,29 @@ Single file, `dccex_throttle.py`. **Stdlib only** — `pyserial` is the sole
 third-party import, and an optional one at that (the Serial radio button
 disables itself if it's absent).
 
-### Environment — per machine
+### Environment
 
-**macOS (MacBook Pro):** run via the venv, and only the venv:
+Per-machine specifics (interpreter choices, editor config, machine list)
+live in `CLAUDE.local.md`, which is gitignored and loaded automatically by
+Claude Code. The rules that travel with the code:
 
-```
-.venv/bin/python dccex_throttle.py
-```
-
-`.venv` is built on **Homebrew python3.14**. It is gitignored; recreate with:
-
-```
-python3.14 -m venv .venv && .venv/bin/pip install pyserial
-```
-
-**Do not run this on the pyenv 3.10.18 that used to be the default.** That
-build links against Apple's **Tcl/Tk 8.5.9**, which renders the GUI at the
-wrong scale on modern macOS. Homebrew 3.14.7 ships **Tk 9.0.4** and lays out
-correctly — same code at the right proportions. Tk version is the thing that
-matters here, not the Python version, so check
-`tkinter.Tcl().call('info', 'patchlevel')` before blaming layout code.
-
-UI metrics are keyed off `tk windowingsystem` (`aqua` vs `x11`) in
-`_build_ui`, not off the OS: x11 gets the 16 pt fonts, the 880x45 slider and
-the `uniform="band"` row group; aqua gets 13 pt (its native widget size), the
-stock slider, and **no** uniform group — uniform makes rows 1 and 2 *request*
-the taller row's height, which pushed the requested window (1307x1365) past a
-MacBook screen. A tiling WM imposes the window size so x11 never notices.
-
-`.vscode/settings.json` pins the interpreter to
-`${workspaceFolder}/.venv/bin/python`.
-Without it VS Code picks a bare Homebrew python3 that has no pyserial,
-and Pylance reports three spurious *"Import 'serial' could not be resolved from
-source"* warnings. Both `.vscode/` and `.venv/` are gitignored — they hold
-machine-specific paths.
-
-**Arch Linux (Hyprland/Omarchy):** same entry point, its own gitignored
-`.venv`, built on the system `python3` (3.14.7, Tk 8.6.16) with pyserial
-installed; recreate with:
-
-```
-python3 -m venv .venv && .venv/bin/pip install pyserial
-```
-
-The system `python3` also runs the app (tkinter is present), just without
-serial support. Under the tiling WM the window is stretched to fill its tile,
-so judge layout by `winfo_reqwidth()`/`winfo_reqheight()`, never by actual
-window size.
+- Run via a project `.venv` with pyserial installed
+  (`python3 -m venv .venv && .venv/bin/pip install pyserial`). Any
+  python3 with tkinter also runs the app, just without serial support.
+- **Tk version, not Python version, decides layout correctness.** Apple's
+  Tcl/Tk 8.5.9 renders at the wrong scale on modern macOS; Tk 9 lays out
+  correctly. Check `tkinter.Tcl().call('info', 'patchlevel')` before
+  blaming layout code.
+- UI metrics are keyed off `tk windowingsystem` (`aqua` vs `x11`) in
+  `_build_ui`, not off the OS: x11 gets the 16 pt fonts, the 880x45 slider
+  and the `uniform="band"` row group; aqua gets 13 pt (its native widget
+  size), the stock slider, and **no** uniform group — uniform makes rows 1
+  and 2 *request* the taller row's height, which pushed the requested
+  window (1307x1365) past a MacBook screen. A tiling WM imposes the window
+  size so x11 never notices.
+- Under a tiling WM the window is stretched to fill its tile, so judge
+  layout by `winfo_reqwidth()`/`winfo_reqheight()`, never by actual
+  window size.
 
 ### Release packaging
 

@@ -73,14 +73,21 @@ Gotchas the reference spells out:
 - `<F>` accepts func **0-68** (RCN-212). The old 0-28 limit belongs to the
   deprecated `<f cab byte1 byte2>` form. But `functMap` in the `<l>` broadcast
   is only 32 bits, so **F0-F31 is the practical ceiling** for anything that
-  needs to stay in sync. The app currently exposes **F1-F8 only**
-  (`FUNCTIONS = range(1, 9)`), momentary: plain `ttk.Button`s with
-  press/release bindings that send `<F 1>` / `<F 0>` (`_func_momentary`).
-  Exception: `TOGGLE_FUNCS` (F3, the owner's short whistle) send one
-  command per press, alternating 1/0 (`_func_toggle`, release ignored):
+  needs to stay in sync. The app currently exposes **F0-F28**
+  (`FUNCTIONS = range(0, 29)`, ten buttons per decade row), each button
+  **per-button momentary or toggle**, flipped by right-click
+  (`_func_mode_flip`; `<Button-3>` and `<Button-2>` both bound for aqua)
+  and persisted to `~/.config/dccex-throttle.json`
+  (`CONFIG_PATH`; unreadable/garbled file falls back to the
+  `TOGGLE_FUNCS = {3}` default — F3 is the owner's short whistle).
+  Momentary buttons send `<F 1>` / `<F 0>` on press/release
+  (`_func_momentary`); toggle buttons send one command per press,
+  alternating 1/0 (`_func_toggle`, release ignored) — right for latched
+  functions like lights, and the only single-toot option for sounds:
   the decoder sounds on *every* edge, so both the press/release pair and
-  a timed on/off pulse tooted twice — one edge per click is the only
-  single-toot option.
+  a timed on/off pulse tooted twice. Toggle mode shows as **underlined**
+  button text (`FuncToggle.TButton`) — a font attribute, because aqua
+  ignores foreground colour on ttk buttons.
   There is no latched widget state to revert on a failed
   send; `func_vars` mirrors the true state from `<l>` broadcasts, and it is
   what `_all_funcs_off` consults. Going past F31 means accepting write-only

@@ -21,8 +21,10 @@ Commands used:
   <1> <0> <1 MAIN> ...    track power
   <t cab>                 request a state re-broadcast (<l ...>) for one loco
   <t cab speed dir>       throttle   speed 0-126, -1 = estop, dir 1=fwd 0=rev
-  <F cab func state>      function   func 0-68 protocol; F1-F8 exposed here as
-                                     momentary buttons (1 on press, 0 on release)
+  <F cab func state>      function   func 0-68 protocol; F0-F28 exposed here as
+                                     buttons, each momentary (1 on press, 0 on
+                                     release) or toggle (one edge per press);
+                                     right-click a button to flip its mode
   <!>                     emergency stop everything
   <c>                     track current, polled 1/s while connected
   <R> <R cv>              prog track: read loco address / read CV
@@ -39,6 +41,8 @@ Messages parsed:
   <w cab>                          address write ack (-1 = failed)
 """
 
+import json
+import os
 import queue
 import re
 import socket
@@ -56,8 +60,10 @@ except ImportError:
     list_ports = None
 HAVE_SERIAL = serial is not None
 
-FUNCTIONS = range(1, 9)       # F1-F8, momentary: on while held, off on release
-TOGGLE_FUNCS = {3}            # decoder sounds these on EVERY edge: toggle per press
+FUNCTIONS = range(0, 29)      # F0-F28, momentary: on while held, off on release
+TOGGLE_FUNCS = {3}            # default toggle-mode buttons; right-click flips any
+                              # button's mode at runtime, saved to CONFIG_PATH
+CONFIG_PATH = os.path.expanduser("~/.config/dccex-throttle.json")
 MAX_SPEED = 126
 SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
 CURRENT_POLL_MS = 1000        # how often to ask the station for track current
@@ -264,6 +270,11 @@ class ThrottleApp(tk.Tk):
         style.configure("TButton", padding=(6, 3))
         style.configure("Func.TButton", font=("TkDefaultFont", base, "bold"),
                         padding=(8, 6))
+        # Toggle-mode variant: underline, not colour -- aqua ignores
+        # foreground on ttk buttons, but a font attribute renders everywhere.
+        style.configure("FuncToggle.TButton",
+                        font=("TkDefaultFont", base, "bold underline"),
+                        padding=(8, 6))
         style.configure("Stop.TButton", font=("TkDefaultFont", base, "bold"),
                         padding=(8, 4))
 
@@ -407,23 +418,28 @@ class ThrottleApp(tk.Tk):
         loco.columnconfigure(5, weight=1)
 
         # --- Functions -----------------------------------------------------
-        funcs = ttk.LabelFrame(run_tab, text="Functions")
+        funcs = ttk.LabelFrame(
+            run_tab, text="Functions (right-click a button: momentary/toggle)")
         funcs.pack(fill="both", expand=True, padx=6, pady=4)
         self.func_vars = {}
-        cols = 4
+        self.func_buttons = {}
+        self.toggle_funcs = self._load_func_modes()
+        cols = 10  # decade rows: F0-F9 / F10-F19 / F20-F28
         for i, n in enumerate(FUNCTIONS):
-            # Momentary (<F 1> on press, <F 0> on release) except TOGGLE_FUNCS,
-            # which flip state once per press. No variable -- the widget's
-            # pressed look is the feedback, and func_vars[n] still tracks the
-            # real state via the <l> broadcast.
+            # Momentary (<F 1> on press, <F 0> on release) or toggle (one
+            # command per press, alternating 1/0). Right-click flips a
+            # button's mode; toggle mode shows as underlined text. No
+            # variable on the widget -- its pressed look is the feedback, and
+            # func_vars[n] still tracks the real state via the <l> broadcast.
             var = tk.IntVar(value=0)
             self.func_vars[n] = var
-            w = ttk.Button(funcs, text=f"F{n}", style="Func.TButton")
-            if n in TOGGLE_FUNCS:
-                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_toggle(k))
-            else:
-                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
-                w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
+            w = ttk.Button(funcs, text=f"F{n}")
+            self.func_buttons[n] = w
+            w.bind("<ButtonPress-1>", lambda e, k=n: self._func_press(k))
+            w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_release(k))
+            for ev in ("<Button-3>", "<Button-2>"):  # right-click; aqua pre-Tk 8.7 reports it as 2
+                w.bind(ev, lambda e, k=n: self._func_mode_flip(k))
+            self._style_func_button(n)
             w.grid(row=i // cols, column=i % cols, sticky="nsew", padx=6, pady=5)
         func_rows = (len(FUNCTIONS) + cols - 1) // cols
         for c in range(cols):
@@ -431,7 +447,7 @@ class ThrottleApp(tk.Tk):
         for r in range(func_rows):
             funcs.rowconfigure(r, weight=1)
         ttk.Button(funcs, text="All Functions Off", command=self._all_funcs_off).grid(
-            row=func_rows, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 6))
+            row=func_rows, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 6))
 
         # --- Programming tab ------------------------------------------------
         svc = ttk.LabelFrame(prog_tab, text="Programming Track (service mode)")
@@ -782,23 +798,71 @@ class ThrottleApp(tk.Tk):
         self.pending_speed = None
         self.last_state = (0, self.direction.get())
 
+    def _func_press(self, n):
+        """Left press: dispatch on the button's current mode."""
+        if n in self.toggle_funcs:
+            self._func_toggle(n)
+        else:
+            self._func_momentary(n, 1)
+
+    def _func_release(self, n):
+        """Left release: only momentary buttons act on it."""
+        if n not in self.toggle_funcs:
+            self._func_momentary(n, 0)
+
     def _func_momentary(self, n, state):
-        """Press/release for the momentary function buttons. Nothing to revert
+        """Press/release for a momentary-mode button. Nothing to revert
         on a failed send: the button has no latched state, and a release lost
         with the link leaves func_vars[n] to be corrected by the next <l>
         broadcast."""
         self.send_cmd(f"<F {self.cab.get()} {n} {state}>")
 
     def _func_toggle(self, n):
-        """Press for TOGGLE_FUNCS: one command per click, alternating 1/0,
-        release ignored. The decoder sounds on every edge, so any on/off pair
-        per click toots twice; a toggle makes exactly one edge per click.
+        """Press for a toggle-mode button: one command per click, alternating
+        1/0, release ignored. A sound decoder acts on every edge, so any
+        on/off pair per click toots twice; a toggle makes exactly one edge per
+        click -- and it is also what latched functions (lights) want.
         func_vars[n] is updated on a good send so a fast second press flips
         the right way even before the <l> broadcast lands."""
         var = self.func_vars[n]
         state = 0 if var.get() else 1
         if self.send_cmd(f"<F {self.cab.get()} {n} {state}>"):
             var.set(state)
+
+    def _func_mode_flip(self, n):
+        """Right-click: flip a button between momentary and toggle mode."""
+        if n in self.toggle_funcs:
+            self.toggle_funcs.discard(n)
+            self._log(f"-- F{n} mode: momentary", "info")
+        else:
+            self.toggle_funcs.add(n)
+            self._log(f"-- F{n} mode: toggle", "info")
+        self._style_func_button(n)
+        self._save_func_modes()
+
+    def _style_func_button(self, n):
+        self.func_buttons[n].configure(
+            style="FuncToggle.TButton" if n in self.toggle_funcs
+            else "Func.TButton")
+
+    def _load_func_modes(self):
+        """The set of toggle-mode functions: CONFIG_PATH if readable and
+        sane, else the TOGGLE_FUNCS default. Numbers outside FUNCTIONS are
+        dropped rather than failing the whole file."""
+        try:
+            with open(CONFIG_PATH) as f:
+                nums = json.load(f)["toggle_funcs"]
+            return {n for n in map(int, nums) if n in FUNCTIONS}
+        except (OSError, ValueError, KeyError, TypeError):
+            return set(TOGGLE_FUNCS)
+
+    def _save_func_modes(self):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            with open(CONFIG_PATH, "w") as f:
+                json.dump({"toggle_funcs": sorted(self.toggle_funcs)}, f)
+        except OSError as e:
+            self._log(f"-- could not save {CONFIG_PATH}: {e}", "err")
 
     def _all_funcs_off(self):
         for n, var in self.func_vars.items():

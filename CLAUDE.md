@@ -208,7 +208,8 @@ window size.
   bands on a root grid: (0) Connection + Track Power/Current, sized to hug
   its content — no stretch, no filler whitespace; (1) a `ttk.Notebook` with
   a **Run** tab (Locomotive + Functions) and a **Programming** tab
-  (service-mode address/CV read-write + POM write); (2) the Console. Rows 1
+  (service-mode address/CV read-write, a CV29 bit editor, POM write);
+  (2) the Console. Rows 1
   and 2 split the remaining height equally (`weight=1, uniform="band"`).
   Connection, power and console are deliberately outside the notebook —
   PROG power and the log matter on both tabs.
@@ -308,6 +309,15 @@ window size.
 - POM ("Write on Main") targets the loco selected on the **Run** tab
   (`self.cab`), read at click time. It gets no reply by design — the label
   says to watch the loco.
+- The CV29 bit editor exposes bits 0-5 as checkboxes; toggling only updates
+  the preview label ("(not written)") — nothing is sent until Write CV29.
+  **Bits 6-7 are not editable but are preserved** (`self.cv29_high`, taken
+  from the last confirmed value) so a write can't clobber the
+  accessory-decoder flag; before any read they default to 0, which is
+  correct for loco decoders. Any `<v 29 x>` or `<r 29 x>` — including one
+  from the plain CV read/write fields — re-syncs the checkboxes.
+  `var.set()` doesn't fire Checkbutton commands, so the sync needs no
+  `syncing` guard.
 
 ### Current display
 
@@ -340,9 +350,11 @@ window size.
    `<- cab>` frees them.
 2. Consist support — use the **CSConsist** command-station consists, not the
    deprecated in-throttle consists.
-3. Programming tab polish: a CV name lookup table (1/2/3/4/5/6/17/18/29...),
-   a CV29 bit editor, and long-address read/write helpers built on CV17/18.
-   The basic read/write/POM plumbing and reply parsing already exist.
+3. Programming tab polish: a CV name lookup table (1/2/3/4/5/6/17/18/29...)
+   and long-address read/write helpers built on CV17/18. Basic
+   read/write/POM plumbing, reply parsing and the CV29 bit editor exist;
+   `<V cv value>` verify-with-guess reads would speed up slow service-mode
+   reads.
 4. Turnout/accessory panel driven by `<JT>` discovery.
 5. Auto-reconnect with backoff; currently a dropped link just reports and stops.
 6. mDNS/bonjour discovery of the command station instead of a typed IP.

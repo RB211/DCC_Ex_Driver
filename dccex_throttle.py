@@ -195,6 +195,7 @@ class ThrottleApp(tk.Tk):
         self.max_ma = None             # motor driver capability
         self.trip_ma = None            # software circuit breaker limit
         self.overload = False          # latched by <p2>, cleared by <p0>/<p1>
+        self.cv29_high = 0             # CV29 bits 6-7, preserved from last read
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -398,6 +399,32 @@ class ThrottleApp(tk.Tk):
         self.prog_result = tk.StringVar(value="result: --")
         ttk.Label(svc, textvariable=self.prog_result).grid(
             row=3, column=0, columnspan=6, sticky="w", padx=6, pady=(2, 6))
+
+        # --- CV29 bit editor -------------------------------------------------
+        cv29 = ttk.LabelFrame(prog_tab, text="CV29 Bit Editor (prog track)")
+        cv29.pack(fill="x", padx=6, pady=4)
+        self.cv29_bits = {}
+        for i, (bit, label) in enumerate([
+            (0, "Reverse direction"), (1, "28/128 speed steps"),
+            (2, "Analog (DC) mode"), (3, "RailCom"),
+            (4, "Custom speed table"), (5, "Long address (CV17/18)"),
+        ]):
+            var = tk.IntVar(value=0)
+            self.cv29_bits[bit] = var
+            # Toggling only updates the preview; nothing is sent until Write.
+            ttk.Checkbutton(cv29, text=f"{label} (b{bit})", variable=var,
+                            command=self._cv29_edited).grid(
+                row=i // 3, column=i % 3, sticky="w", padx=6, pady=2)
+        self.cv29_text = tk.StringVar(value="CV29 = --")
+        ttk.Label(cv29, textvariable=self.cv29_text).grid(
+            row=2, column=0, sticky="w", padx=6, pady=(2, 4))
+        ttk.Button(cv29, text="Read CV29", command=self._cv29_read).grid(
+            row=2, column=1, sticky="e", padx=4, pady=(2, 4))
+        ttk.Button(cv29, text="Write CV29", command=self._cv29_write).grid(
+            row=2, column=2, sticky="w", padx=4, pady=(2, 4))
+        ttk.Label(cv29, text="Bit 5 only selects which address is used -- "
+                             "change addresses with Write Address, not here.").grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
 
         pom = ttk.LabelFrame(prog_tab, text="Program on Main (POM)")
         pom.pack(fill="x", padx=6, pady=4)
@@ -717,6 +744,38 @@ class ThrottleApp(tk.Tk):
         if val is not None:
             self.send_cmd(f"<w {self.cab.get()} {cv} {val}>")
 
+    def _cv29_value(self):
+        """Compose CV29 from the checkboxes plus the preserved high bits."""
+        val = self.cv29_high
+        for bit, var in self.cv29_bits.items():
+            if var.get():
+                val |= 1 << bit
+        return val
+
+    def _cv29_edited(self):
+        self.cv29_text.set(f"CV29 = {self._cv29_value()} (not written)")
+
+    def _cv29_read(self):
+        if self.send_cmd("<R 29>"):
+            self.prog_result.set("reading CV 29...")
+
+    def _cv29_write(self):
+        val = self._cv29_value()
+        if self.send_cmd(f"<W 29 {val}>"):
+            self.prog_result.set(f"writing CV 29 = {val}...")
+
+    def _cv29_sync(self, value):
+        """Mirror a confirmed CV29 (from <v 29 x> or <r 29 x>) into the editor.
+
+        Bits 6-7 aren't editable (reserved / accessory-decoder flag) but are
+        preserved so a later write doesn't clobber them. var.set() does not
+        fire Checkbutton commands, so no syncing guard is needed here.
+        """
+        self.cv29_high = value & 0xC0
+        for bit, var in self.cv29_bits.items():
+            var.set(1 if value & (1 << bit) else 0)
+        self.cv29_text.set(f"CV29 = {value}")
+
     # ---------------- inbound ----------------
     def _pump(self):
         try:
@@ -782,6 +841,8 @@ class ThrottleApp(tk.Tk):
             else:
                 self.prog_result.set(f"CV {cv} = {value}")
                 self.prog_val.set(value)   # prime for a read-modify-write
+                if cv == "29" and value.isdigit():
+                    self._cv29_sync(int(value))
 
         # <r cv value> -- CV write ack; <r address> -- address read result
         elif head == "r":
@@ -789,6 +850,8 @@ class ThrottleApp(tk.Tk):
                 cv, value = parts[1], parts[2]
                 self.prog_result.set(f"CV {cv} write FAILED" if value == "-1"
                                      else f"CV {cv} written: {value}")
+                if cv == "29" and value.isdigit():
+                    self._cv29_sync(int(value))
             elif len(parts) == 2:
                 addr = parts[1]
                 if addr == "-1":

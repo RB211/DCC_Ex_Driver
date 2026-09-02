@@ -76,9 +76,11 @@ Gotchas the reference spells out:
   needs to stay in sync. The app currently exposes **F1-F8 only**
   (`FUNCTIONS = range(1, 9)`), momentary: plain `ttk.Button`s with
   press/release bindings that send `<F 1>` / `<F 0>` (`_func_momentary`).
-  Exception: `PULSE_FUNCS` (F3, the owner's short whistle) fire a single
-  on/off pulse on press (`_func_pulse`, `FUNC_PULSE_MS` gap) because the
-  decoder sounds on both edges — release-driven off made it toot twice.
+  Exception: `TOGGLE_FUNCS` (F3, the owner's short whistle) send one
+  command per press, alternating 1/0 (`_func_toggle`, release ignored):
+  the decoder sounds on *every* edge, so both the press/release pair and
+  a timed on/off pulse tooted twice — one edge per click is the only
+  single-toot option.
   There is no latched widget state to revert on a failed
   send; `func_vars` mirrors the true state from `<l>` broadcasts, and it is
   what `_all_funcs_off` consults. Going past F31 means accepting write-only

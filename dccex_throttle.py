@@ -57,8 +57,7 @@ except ImportError:
 HAVE_SERIAL = serial is not None
 
 FUNCTIONS = range(1, 9)       # F1-F8, momentary: on while held, off on release
-PULSE_FUNCS = {3}             # decoder sounds these on BOTH edges: pulse on press only
-FUNC_PULSE_MS = 120           # on-to-off gap for pulsed functions
+TOGGLE_FUNCS = {3}            # decoder sounds these on EVERY edge: toggle per press
 MAX_SPEED = 126
 SEND_INTERVAL = 0.08          # seconds between throttle updates while dragging
 CURRENT_POLL_MS = 1000        # how often to ask the station for track current
@@ -397,15 +396,15 @@ class ThrottleApp(tk.Tk):
         self.func_vars = {}
         cols = 4
         for i, n in enumerate(FUNCTIONS):
-            # Momentary (<F 1> on press, <F 0> on release) except PULSE_FUNCS,
-            # which pulse on press. No variable -- the widget's pressed look is
-            # the feedback, and func_vars[n] still tracks the real state via
-            # the <l> broadcast.
+            # Momentary (<F 1> on press, <F 0> on release) except TOGGLE_FUNCS,
+            # which flip state once per press. No variable -- the widget's
+            # pressed look is the feedback, and func_vars[n] still tracks the
+            # real state via the <l> broadcast.
             var = tk.IntVar(value=0)
             self.func_vars[n] = var
             w = ttk.Button(funcs, text=f"F{n}", style="Func.TButton")
-            if n in PULSE_FUNCS:
-                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_pulse(k))
+            if n in TOGGLE_FUNCS:
+                w.bind("<ButtonPress-1>", lambda e, k=n: self._func_toggle(k))
             else:
                 w.bind("<ButtonPress-1>", lambda e, k=n: self._func_momentary(k, 1))
                 w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_momentary(k, 0))
@@ -774,14 +773,16 @@ class ThrottleApp(tk.Tk):
         broadcast."""
         self.send_cmd(f"<F {self.cab.get()} {n} {state}>")
 
-    def _func_pulse(self, n):
-        """Press for PULSE_FUNCS: one on/off pulse per click, release ignored.
-        The decoder acts on both edges, so tying the off to the button release
-        would sound the function twice. Cab is captured at press so the off
-        reaches the same loco even if the spinbox changes mid-pulse."""
-        cab = self.cab.get()
-        if self.send_cmd(f"<F {cab} {n} 1>"):
-            self.after(FUNC_PULSE_MS, lambda: self.send_cmd(f"<F {cab} {n} 0>"))
+    def _func_toggle(self, n):
+        """Press for TOGGLE_FUNCS: one command per click, alternating 1/0,
+        release ignored. The decoder sounds on every edge, so any on/off pair
+        per click toots twice; a toggle makes exactly one edge per click.
+        func_vars[n] is updated on a good send so a fast second press flips
+        the right way even before the <l> broadcast lands."""
+        var = self.func_vars[n]
+        state = 0 if var.get() else 1
+        if self.send_cmd(f"<F {self.cab.get()} {n} {state}>"):
+            var.set(state)
 
     def _all_funcs_off(self):
         for n, var in self.func_vars.items():

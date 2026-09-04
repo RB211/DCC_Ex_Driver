@@ -72,13 +72,21 @@ Gotchas the reference spells out:
 - `<F>` accepts func **0-68** (RCN-212). The old 0-28 limit belongs to the
   deprecated `<f cab byte1 byte2>` form. But `functMap` in the `<l>` broadcast
   is only 32 bits, so **F0-F31 is the practical ceiling** for anything that
-  needs to stay in sync. The app currently exposes **F0-F28**
-  (`FUNCTIONS = range(0, 29)`, ten buttons per decade row), each button
+  needs to stay in sync. The app exposes **F0-F28**
+  (`FUNCTIONS = range(0, 29)`) as buttons **per loco tab**: each loco's
+  Setup… dialog picks which functions its tab shows and gives each button a
+  label. Unlabelled layouts flow ten per decade row; as soon as any visible
+  button is labelled the flow drops to six per row (`_reflow_funcs`). All 29
+  buttons exist per panel — hidden ones still track state from `<l>`, so
+  All Functions Off covers them too. Each button is
   **per-button momentary or toggle**, flipped by right-click
-  (`_func_mode_flip`; `<Button-3>` and `<Button-2>` both bound for aqua)
-  and persisted to `~/.config/dccex-throttle.json`
-  (`CONFIG_PATH`; unreadable/garbled file falls back to the
-  `TOGGLE_FUNCS = {3}` default — F3 is the owner's short whistle).
+  (`_func_mode_flip`; `<Button-3>` and `<Button-2>` both bound for aqua).
+  Everything is persisted per loco to `~/.config/dccex-throttle.json`
+  (`CONFIG_PATH`, schema `{"locos": [{name, address, toggle_funcs,
+  show_funcs, labels}]}`; the pre-multi-loco `{"toggle_funcs": [...]}` file
+  migrates to a single loco via `load_loco_cfgs`, and an unreadable/garbled
+  file falls back to one default loco with `TOGGLE_FUNCS = {3}` — F3 is the
+  owner's short whistle).
   Momentary buttons send `<F 1>` / `<F 0>` on press/release
   (`_func_momentary`); toggle buttons send one command per press,
   alternating 1/0 (`_func_toggle`, release ignored) — right for latched
@@ -220,15 +228,57 @@ Output lands in `dist/` (gitignored along with `build/` and `*.spec`).
 - `TcpTransport` — `socket.create_connection`, 0.4 s recv timeout so the
   reader thread can notice the stop flag.
 - `SerialTransport` — pyserial, same contract.
-- `ThrottleApp(tk.Tk)` — all UI and state. The window is three vertical
+- `LocoPanel(ttk.Frame)` — one locomotive tab. Owns everything specific to
+  a single address: the throttle widgets, function buttons, and the
+  per-loco send/sync state that used to be app-global (`syncing`,
+  `pending_speed`, `last_state`, `last_sent`, `active_cab`). Panels never
+  touch the transport, only `app.send_cmd()`.
+- `LocoSetupDialog(tk.Toplevel)` — per-loco Setup: loco name, a show
+  checkbox + label entry per function, Remove This Loco. The **name
+  applies live** (a trace on `name_var` renames the panel and retitles the
+  tab per keystroke — owner requirement after apply-on-close read as "can't
+  rename"); everything else applies on close (`apply_setup`), which also
+  saves the config. **Placed over the throttle window** by the
+  withdraw → build → `update_idletasks` → `geometry(WxH+x+y)` → `deiconify`
+  sequence, clamped to the screen. The position has to travel with the
+  *initial* map: mapping first and moving afterwards worked about one time
+  in three on Hyprland (a ConfigureRequest that lands between the map and
+  the surface's first frame is dropped), and the rest of the time the
+  dialog sat at the monitor's top-left, where the panel bar hid the name
+  row and the owner concluded renaming didn't exist. Verified 12/12 with
+  `hyprctl clients -j`; don't reorder those steps. Opened by
+  the panel's Setup… button, and automatically by `_add_loco` so a new
+  "Loco <addr>" tab is offered a name at once (the
+  double-click-on-tab shortcut was removed at owner request — it stacked
+  accidental duplicates), always through **`app._open_setup`**, which
+  enforces **one window per loco** (`panel.setup_dialog`; a second request
+  re-focuses the existing window's name entry). Never construct one
+  directly: a stale duplicate closing last re-applies its old values —
+  the bug that silently reverted renames. Non-modal (no `grab_set`) so
+  several locos can each have a window open; the name entry takes focus on
+  open. Every close path goes through `_close()`, which frees the slot;
+  `_done` skips `apply_setup` if the panel is already destroyed so an
+  orphaned window can still close. `_remove_loco` refuses a panel whose
+  Setup window is open (the dialog's own Remove button closes itself
+  first).
+- `ThrottleApp(tk.Tk)` — transport, shared UI, and the loco tab roster.
+  The window is three vertical
   bands on a root grid: (0) Connection + Track Power/Current, sized to hug
   its content — no stretch, no filler whitespace; (1) a `ttk.Notebook` with
-  a **Run** tab (Locomotive + Functions) and a **Programming** tab
+  a **Run** tab and a **Programming** tab
   (service-mode address/CV read-write, a CV29 bit editor, POM write);
   (2) the Console. Rows 1
   and 2 split the remaining height equally (`weight=1, uniform="band"`).
   Connection, power and console are deliberately outside the notebook —
   PROG power and the log matter on both tabs.
+  The Run tab holds an inner notebook (`loco_nb`) of `LocoPanel`s plus a
+  trailing **"+" tab**; selecting "+" creates a loco on the next free
+  address (`_add_loco`). `_remove_loco` selects a neighbour *before*
+  `forget()` — otherwise ttk auto-selects the next tab, which for the
+  rightmost loco is "+", spawning a phantom loco. `self.active_panel`
+  (updated on `<<NotebookTabChanged>>`) is what POM targets; it is tracked
+  because `loco_nb.select()` still points at a loco tab even while the
+  Programming tab is in front, but a widget-level attribute is simpler.
   Font policy (owner requirement): **one text size everywhere — 16 pt via
   the named fonts** (`TkDefaultFont`/`TkTextFont`/`TkHeadingFont`;
   `TkFixedFont` 13 for the console log). Every widget inherits it: labels,
@@ -242,35 +292,42 @@ Output lands in `dist/` (gitignored along with `build/` and `*.spec`).
 
 ### Key invariants — do not break these
 
-- **`self.syncing`** is set while the UI is being updated from an inbound
-  broadcast. Every widget callback must return early when it's true, or you
-  get an infinite echo loop between the app and the command station.
-- **`self.last_state`** holds the `(speed, dir)` tuple actually transmitted.
+All four state flags below live **per `LocoPanel`**, not on the app — each
+loco tab syncs and sends independently.
+
+- **`panel.syncing`** is set while a panel's UI is being updated from an
+  inbound broadcast. Every widget callback must return early when it's true,
+  or you get an infinite echo loop between the app and the command station.
+- **`panel.last_state`** holds the `(speed, dir)` tuple actually transmitted.
   The speed tick compares against it to avoid duplicate sends. Only
   `_send_throttle()` commits it, and only after a successful send. `(None,
   None)` means "the loco's state is unknown", which forces the next slider
   move to transmit.
-- **`self.pending_speed` is a one-shot request, not a mirror of the slider.**
+- **`panel.pending_speed` is a one-shot request, not a mirror of the slider.**
   `None` means nothing is owed to the station. Lifecycle:
   - *Armed* only by `_speed_moved()`, on real user input (it returns early
     when `syncing`).
-  - *Retired* by `_speed_tick()` on all three of its exits — sent, redundant
+  - *Retired* by `panel.tick()` (driven from the app's single 30 ms
+    `_speed_tick` loop) on all three of its exits — sent, redundant
     (`target == last_state`), or send failed. *Every* path out must clear it.
     Leaving it armed is the bug that made the tick re-test the same value
     every 30 ms forever.
   - *Discarded* wherever the slider's intent stops being meaningful:
-    `_cab_changed()` (different loco), `_stop()` / `_estop_all()` (an explicit
-    stop outranks a queued speed), `_handle()` on an inbound `<l>` (the
-    station just told us the truth), and `_toggle_connect()`.
-  The `_toggle_connect()` one is the subtle one. Dragging the slider while
+    `_cab_changed()` (different loco), `_stop()` / `estop_zero()` (an explicit
+    stop outranks a queued speed), `sync_from_broadcast()` on an inbound `<l>`
+    (the station just told us the truth), and `reset_link_state()`, which
+    `_toggle_connect()` runs on every panel before `<s>`.
+  The connect-time one is the subtle one. Dragging the slider while
   disconnected arms the flag with no transport to consume it, so without the
   clear, the first tick after Connect would issue `<t cab speed dir>` and the
   loco would take off with the user having touched nothing since connecting.
   **Never let a value survive from one connection into the next.**
-- **`self.active_cab`** is the address `_cab_changed` last acted on. The
+- **`panel.active_cab`** is the address `_cab_changed` last acted on, and the
+  address every send uses (never a mid-edit `cab.get()`). The
   spinbox is bound to `<FocusOut>` as well as `<Return>` and `command=`, so
   without this guard every focus change would re-zero the UI and re-request
-  state.
+  state. The `<l>` handler fans each broadcast out to **every** panel whose
+  `active_cab` matches — two tabs on one address both stay in sync.
 - **`send_cmd()` returns True only if the command reached the wire.** (Named
   `send_cmd` because `tk.Misc` already owns `send()` — Tk's inter-interpreter
   send — and overriding it trips Pylance and risks confusion.) Tk applies a
@@ -305,12 +362,21 @@ Output lands in `dist/` (gitignored along with `build/` and `*.spec`).
 
 ### Deliberate behaviours
 
-- Changing the loco address zeroes the UI, then calls `_request_cab_state()`
+- Changing a panel's loco address zeroes that panel, then calls
+  `panel.request_state()`
   to send `<t cab>` — the station re-broadcasts `<l>` for that address, and
-  the normal inbound path syncs the widgets. The same call runs after `<s>`
-  on connect so the initially-selected loco syncs too. If the loco isn't in
+  the normal inbound path syncs the widgets. The same call runs for **every**
+  panel after `<s>` on connect (and for a freshly added loco tab) so each
+  syncs without guessing. If the loco isn't in
   the reminders table the reply carries slot `-1` and the zeroed UI is already
   correct, so the slot field is ignored.
+- A loco tab's name lives only in the config. A named tab shows **just the
+  name, no address suffix** (owner requirement — the earlier "Name (addr)"
+  form was rejected); a blank name shows "Loco <addr>", and an address
+  change retitles only that form. Config saves happen at the
+  point of every mutation (mode flip, Setup close, add/remove tab, address
+  change), plus one save in `_on_close` — needed because a live-typed
+  rename only reaches the file when its Setup window closes.
 - The spinbox `command=` callback only fires on the arrow buttons, which is
   why the typed-address path needs the explicit `<Return>`/`<FocusOut>`
   bindings. Don't remove them.
@@ -332,8 +398,8 @@ Output lands in `dist/` (gitignored along with `build/` and `*.spec`).
   (`_prog_int`: CV 1-1024, value 0-255, address 1-10293); a bad entry logs an
   error and sends nothing. The result label shows "...ing" while a reply is
   outstanding and is overwritten by the parsed `<v>`/`<r>`/`<w>` reply.
-- POM ("Write on Main") targets the loco selected on the **Run** tab
-  (`self.cab`), read at click time. It gets no reply by design — the label
+- POM ("Write on Main") targets the selected **loco tab**
+  (`self.active_panel.active_cab`), read at click time. It gets no reply by design — the label
   says to watch the loco.
 - CV entries have a live name lookup: `CV_NAMES` (common NMRA S-9.2.2 CVs)
   plus range rules in `cv_name()` (33-46 function mapping, 67-94 speed table,
@@ -376,10 +442,10 @@ Output lands in `dist/` (gitignored along with `build/` and `*.spec`).
 
 ## 5. Likely next steps
 
-1. Multi-loco: tabs or a roster list, keeping per-address speed/function state
-   in a dict rather than a single set of widgets. `<t cab>` per address gives
-   a clean initial sync for each; `<#>` reports how many slots exist and
-   `<- cab>` frees them.
+1. ~~Multi-loco~~ — done: loco tabs (`LocoPanel`) with per-tab names,
+   function subsets and labels. Still open from this item: `<#>` reports how
+   many slots the station has and `<- cab>` frees them — the app never
+   forgets a loco on the station side when a tab is removed.
 2. Consist support — use the **CSConsist** command-station consists, not the
    deprecated in-throttle consists.
 3. Programming tab polish: long-address read/write helpers built on CV17/18.

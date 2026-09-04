@@ -7,14 +7,18 @@ protocol directly to an EX-CommandStation (EX-CSB1 etc.) over TCP or USB serial.
 
   TCP    : default port 2560
   Serial : default 115200 baud (requires pyserial; optional)
-  
+
 The command station auto-selects native vs WiThrottle protocol based on the
 first command it receives, so this client sends <s> immediately on connect to
 lock it into native mode and pull the version/status.
 
-The UI is two tabs -- Run (throttle + functions) and Programming (service-mode
-and POM CV access) -- with connection, track power and the console shared
-above/below the tabs.
+The UI is two tabs -- Run and Programming (service-mode and POM CV access) --
+with connection, track power and the console shared above/below the tabs.
+The Run tab is itself a notebook of locomotive tabs (plus a "+" tab to add
+one): each loco tab has its own address, throttle, direction and function
+buttons. Setup... on a tab (opened automatically for a freshly added loco)
+names the tab, picks which functions it shows and labels each button;
+everything is saved per loco to the config file.
 
 Commands used:
   <s>                     status / version
@@ -108,6 +112,80 @@ def cv_name(cv):
     if 112 <= cv <= 256:
         return "Manufacturer-specific"
     return None
+
+
+# --------------------------------------------------------------------------
+# Per-loco configuration
+# --------------------------------------------------------------------------
+# CONFIG_PATH schema: {"locos": [{"name": str, "address": int,
+#   "toggle_funcs": [int], "show_funcs": [int], "labels": {"n": str}}]}
+# The pre-multi-loco file was {"toggle_funcs": [int]}; load_loco_cfgs()
+# migrates it to a single loco so nobody loses their button modes.
+
+def default_loco_cfg(address=3):
+    return {"name": "", "address": address,
+            "toggle_funcs": sorted(TOGGLE_FUNCS),
+            "show_funcs": list(FUNCTIONS), "labels": {}}
+
+
+def clean_loco_cfg(raw):
+    """One sanitized loco dict from the config file, or None if hopeless.
+
+    Bad fields fall back to their defaults individually rather than failing
+    the whole loco; function numbers outside FUNCTIONS are dropped.
+    """
+    if not isinstance(raw, dict):
+        return None
+    cfg = default_loco_cfg()
+    try:
+        addr = int(raw.get("address", 3))
+        cfg["address"] = addr if 1 <= addr <= 10293 else 3
+    except (TypeError, ValueError):
+        pass
+    if isinstance(raw.get("name"), str):
+        cfg["name"] = raw["name"].strip()
+    for key in ("toggle_funcs", "show_funcs"):
+        try:
+            cfg[key] = sorted({n for n in map(int, raw[key]) if n in FUNCTIONS})
+        except (KeyError, TypeError, ValueError):
+            pass
+    labels = raw.get("labels")
+    if isinstance(labels, dict):
+        out = {}
+        for k, v in labels.items():
+            try:
+                n = int(k)
+            except (TypeError, ValueError):
+                continue
+            if n in FUNCTIONS and isinstance(v, str) and v.strip():
+                out[n] = v.strip()
+        cfg["labels"] = out
+    return cfg
+
+
+def load_loco_cfgs():
+    """The loco list from CONFIG_PATH, migrated/sanitized, never empty."""
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return [default_loco_cfg()]
+    if not isinstance(data, dict):
+        return [default_loco_cfg()]
+    if isinstance(data.get("locos"), list):
+        cfgs = [c for c in map(clean_loco_cfg, data["locos"]) if c]
+        if cfgs:
+            return cfgs
+    if "toggle_funcs" in data:
+        # pre-multi-loco file: one loco, keep its toggle modes
+        cfg = default_loco_cfg()
+        try:
+            cfg["toggle_funcs"] = sorted(
+                {n for n in map(int, data["toggle_funcs"]) if n in FUNCTIONS})
+        except (TypeError, ValueError):
+            pass
+        return [cfg]
+    return [default_loco_cfg()]
 
 
 # --------------------------------------------------------------------------
@@ -223,6 +301,489 @@ class SerialTransport(BaseTransport):
 
 
 # --------------------------------------------------------------------------
+# One locomotive tab
+# --------------------------------------------------------------------------
+class LocoPanel(ttk.Frame):
+    """One locomotive tab on the Run notebook.
+
+    Owns everything specific to a single address -- the throttle widgets, the
+    function buttons, and the per-loco send/sync state that used to be
+    app-global: syncing, pending_speed, last_state, active_cab. The app owns
+    the transport and fans each <l> broadcast out to every panel driving that
+    address; a panel never touches the socket, only app.send_cmd().
+    """
+
+    def __init__(self, app, master, cfg):
+        super().__init__(master)
+        self.app = app
+        self.syncing = False            # suppress outbound sends while syncing UI
+        self.pending_speed = None       # one-shot request, not a slider mirror
+        self.last_sent = 0.0
+        self.last_state = (None, None)  # (speed, dir) actually sent
+        self.name = cfg.get("name", "")
+        self.active_cab = cfg.get("address", 3)
+        self.toggle_funcs = set(cfg.get("toggle_funcs", []))
+        self.show_funcs = set(cfg.get("show_funcs", FUNCTIONS))
+        self.labels = dict(cfg.get("labels", {}))   # {func: button label}
+        self.setup_dialog = None        # the one open Setup window, or None
+        self._build()
+
+    def tab_title(self):
+        """A named loco's tab is just the name (owner requirement -- no
+        address suffix); an unnamed one falls back to "Loco <addr>"."""
+        return self.name or f"Loco {self.active_cab}"
+
+    def to_cfg(self):
+        return {"name": self.name, "address": self.active_cab,
+                "toggle_funcs": sorted(self.toggle_funcs),
+                "show_funcs": sorted(self.show_funcs),
+                "labels": {str(n): lbl for n, lbl in sorted(self.labels.items())}}
+
+    # ---------------- construction ----------------
+    def _build(self):
+        aqua, base = self.app.aqua, self.app.font_base
+        loco = ttk.LabelFrame(self, text="Locomotive")
+        loco.pack(fill="x", padx=6, pady=4)
+
+        ttk.Label(loco, text="Address:").grid(row=0, column=0, padx=(6, 2), pady=6, sticky="e")
+        self.cab = tk.IntVar(value=self.active_cab)
+        spin = ttk.Spinbox(loco, from_=1, to=10293, textvariable=self.cab, width=8,
+                           command=self._cab_changed)
+        spin.grid(row=0, column=1, sticky="w")
+        # command= only fires on the arrows; catch typed addresses too
+        spin.bind("<Return>", self._cab_changed)
+        spin.bind("<FocusOut>", self._cab_changed)
+
+        self.direction = tk.IntVar(value=1)
+        # One big toggle instead of radio buttons: click flips direction.
+        # tk.Button, not ttk -- the colour is the state indicator.
+        self.dir_btn = tk.Button(loco, width=16, fg="white",
+                                 activeforeground="white",
+                                 font=("TkDefaultFont", base, "bold"),
+                                 command=self._dir_toggled)
+        self.dir_btn.grid(row=0, column=2, columnspan=2, padx=(18, 4), pady=4,
+                          sticky="ew")
+        self._refresh_dir()
+
+        ttk.Button(loco, text="STOP", width=10, style="Stop.TButton",
+                   command=self._stop).grid(row=0, column=4, padx=(18, 4))
+        estop = tk.Button(loco, text="E-STOP ALL", width=12, bg="#c62828", fg="white",
+                          activebackground="#e53935", activeforeground="white",
+                          font=("TkDefaultFont", base, "bold"),
+                          command=self.app._estop_all)
+        estop.grid(row=0, column=5, padx=4, pady=4)
+        ttk.Button(loco, text="Setup...",
+                   command=lambda: self.app._open_setup(self)).grid(
+            row=0, column=6, padx=4, pady=4, sticky="w")
+
+        self.speed = tk.IntVar(value=0)
+        # Aqua draws its native slider (width/sliderlength are ignored) and
+        # 880 px would set the whole window's width; the fat 45/70 knob is
+        # x11-only touch tuning.
+        self.scale = tk.Scale(loco, from_=0, to=MAX_SPEED, orient="horizontal",
+                              variable=self.speed, tickinterval=21,
+                              length=640 if aqua else 880,
+                              width=15 if aqua else 45,
+                              sliderlength=30 if aqua else 70,
+                              resolution=1, command=self._speed_moved)
+        self.scale.grid(row=1, column=0, columnspan=7, padx=10, pady=(0, 8), sticky="ew")
+        loco.columnconfigure(6, weight=1)
+
+        # --- Functions -----------------------------------------------------
+        funcs = ttk.LabelFrame(
+            self, text="Functions (right-click a button: momentary/toggle)")
+        funcs.pack(fill="both", expand=True, padx=6, pady=4)
+        self.func_grid = ttk.Frame(funcs)
+        self.func_grid.pack(fill="both", expand=True)
+        self.func_vars = {}
+        self.func_buttons = {}
+        self.func_holders = {}
+        for n in FUNCTIONS:
+            # Momentary (<F 1> on press, <F 0> on release) or toggle (one
+            # command per press, alternating 1/0). Right-click flips a
+            # button's mode; toggle mode shows as underlined text. No
+            # variable on the widget -- func_vars[n] tracks the real state
+            # via the <l> broadcast, and the trace paints the green border
+            # whenever that state changes, whoever changed it. All 29 exist
+            # (hidden ones still track state); _reflow_funcs grids the shown.
+            var = tk.IntVar(value=0)
+            self.func_vars[n] = var
+            holder = tk.Frame(self.func_grid, background=self.app.func_border_off)
+            self.func_holders[n] = holder
+            w = ttk.Button(holder, text=self._func_text(n))
+            self.func_buttons[n] = w
+            w.pack(fill="both", expand=True, padx=3, pady=3)
+            w.bind("<ButtonPress-1>", lambda e, k=n: self._func_press(k))
+            w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_release(k))
+            for ev in ("<Button-3>", "<Button-2>"):  # right-click; aqua pre-Tk 8.7 reports it as 2
+                w.bind(ev, lambda e, k=n: self._func_mode_flip(k))
+            self._style_func_button(n)
+            var.trace_add("write", lambda *_, k=n: self._refresh_func_lamp(k))
+        self._reflow_funcs()
+        ttk.Button(funcs, text="All Functions Off",
+                   command=self._all_funcs_off).pack(
+            side="left", padx=6, pady=(4, 6))
+
+    def _func_text(self, n):
+        label = self.labels.get(n, "").strip()
+        return f"F{n} {label}" if label else f"F{n}"
+
+    def _reflow_funcs(self):
+        """(Re-)grid the visible function buttons in reading order.
+
+        Bare F-numbers keep the 10-wide decade rows; as soon as any visible
+        button carries a label the flow drops to 6 per row so the wider text
+        gets room. Stale row/column weights are cleared so a narrower layout
+        doesn't leave weighted empty columns hogging width.
+        """
+        visible = [n for n in FUNCTIONS if n in self.show_funcs]
+        cols = 6 if any(self.labels.get(n) for n in visible) else 10
+        for holder in self.func_holders.values():
+            holder.grid_forget()
+        for i, n in enumerate(visible):
+            self.func_holders[n].grid(row=i // cols, column=i % cols,
+                                      sticky="nsew", padx=4, pady=3)
+        rows = max(1, -(-len(visible) // cols))
+        for c in range(10):
+            self.func_grid.columnconfigure(c, weight=1 if c < cols else 0)
+        for r in range(5):      # 5 = ceil(29 / 6), the tallest possible flow
+            self.func_grid.rowconfigure(r, weight=1 if r < rows else 0)
+
+    def apply_setup(self, name, show_funcs, labels):
+        """Take the results of the Setup dialog: tab name, visible set, labels."""
+        self.name = name.strip()
+        self.show_funcs = set(show_funcs)
+        self.labels = {n: lbl for n, lbl in labels.items() if lbl.strip()}
+        for n in FUNCTIONS:
+            self.func_buttons[n].configure(text=self._func_text(n))
+        self._reflow_funcs()
+        self.app._retitle(self)
+        self.app._save_config()
+
+    # ---------------- helpers ----------------
+    def _set_quiet(self, var, value):
+        """Write a widget var without tripping its own callback."""
+        self.syncing = True
+        var.set(value)
+        self.syncing = False
+
+    def request_state(self):
+        """<t cab> asks the station to re-broadcast <l> for this address.
+
+        Reply is a normal <l cab reg speedByte functMap> broadcast, so the
+        app's inbound path does the sync. A reg/slot of -1 means the loco
+        isn't in the reminders table yet; the zeroed UI is already right.
+        """
+        if self.app.transport:
+            self.app.send_cmd(f"<t {self.active_cab}>")
+
+    def reset_link_state(self):
+        """Forget anything owed to or believed about the station.
+
+        Called on every (re)connect: a slider dragged while offline is not a
+        command the user meant to issue now, and nothing is known about the
+        loco until <l> arrives. Never let a value survive from one
+        connection into the next.
+        """
+        self.pending_speed = None
+        self.last_state = (None, None)
+
+    # ---------------- throttle ----------------
+    def _send_throttle(self, speed, direction):
+        if not self.app.send_cmd(f"<t {self.active_cab} {speed} {direction}>"):
+            return False
+        self.last_state = (speed, direction)
+        self.last_sent = time.monotonic()
+        return True
+
+    def _speed_moved(self, _value):
+        if self.syncing:
+            return
+        self.pending_speed = self.speed.get()
+
+    def tick(self, now):
+        """Rate-limited send so dragging the slider doesn't flood the station.
+
+        Driven from the app's single 30 ms after() loop. Every path out must
+        retire pending_speed -- leaving it armed makes this re-test the same
+        value every 30 ms forever.
+        """
+        if self.app.transport and self.pending_speed is not None:
+            target = (self.pending_speed, self.direction.get())
+            if target == self.last_state:
+                # Slider landed back where the station already is (a nudge and
+                # an undo inside one SEND_INTERVAL). Nothing to send -- retire
+                # the request instead of re-testing it every 30 ms forever.
+                self.pending_speed = None
+            elif (now - self.last_sent) >= SEND_INTERVAL:
+                self._send_throttle(*target)
+                # Cleared even on a failed send: the transport is gone, and a
+                # stale value must not be replayed at the loco on reconnect.
+                self.pending_speed = None
+
+    def _refresh_dir(self):
+        """Paint the direction toggle from self.direction.
+
+        Plain ASCII on purpose: U+25B6/25C0 arrows go through font fallback
+        (often a double-width color-emoji glyph on Linux) and render far
+        wider than tkfont measures, clipping the label. Colour carries the
+        state; the text stays plain.
+        """
+        if self.direction.get() == 1:
+            self.dir_btn.configure(text="FORWARD", bg="#2e7d32",
+                                   activebackground="#388e3c")
+        else:
+            self.dir_btn.configure(text="REVERSE", bg="#ef6c00",
+                                   activebackground="#f57c00")
+
+    def _dir_toggled(self):
+        """The toggle flips direction; a failed send flips it back."""
+        new = 1 - self.direction.get()
+        self._set_quiet(self.direction, new)
+        self._refresh_dir()
+        if not self._send_throttle(self.speed.get(), new):
+            self._set_quiet(self.direction, 1 - new)
+            self._refresh_dir()
+
+    def _cab_changed(self, *_):
+        try:
+            cab = self.cab.get()
+        except tk.TclError:        # mid-edit / non-numeric text in the spinbox
+            return
+        if cab == self.active_cab:
+            return
+        self.active_cab = cab
+        self.syncing = True
+        self.speed.set(0)
+        self.direction.set(1)
+        for var in self.func_vars.values():
+            var.set(0)
+        self.syncing = False
+        self._refresh_dir()
+        self.pending_speed = None
+        self.last_state = (None, None)
+        self.app._log(f"-- loco {cab} selected", "info")
+        self.app._retitle(self)
+        self.app._save_config()
+        self.request_state()
+
+    def _stop(self):
+        prior = self.speed.get()
+        self._set_quiet(self.speed, 0)
+        self.pending_speed = None
+        if not self._send_throttle(0, self.direction.get()):
+            self._set_quiet(self.speed, prior)   # the loco never got the stop
+
+    def estop_zero(self):
+        """After a successful <!>: this loco is stopped, whatever it was doing."""
+        self._set_quiet(self.speed, 0)
+        self.pending_speed = None
+        self.last_state = (0, self.direction.get())
+
+    def sync_from_broadcast(self, speed_byte, func_map):
+        """Mirror an inbound <l> for this panel's address into the widgets."""
+        direction = 1 if speed_byte & 0x80 else 0
+        raw = speed_byte & 0x7F
+        speed = 0 if raw in (0, 1) else raw - 1
+        self.syncing = True
+        self.speed.set(speed)
+        self.direction.set(direction)
+        for n, var in self.func_vars.items():
+            var.set(1 if func_map & (1 << n) else 0)
+        self.syncing = False
+        self._refresh_dir()
+        self.last_state = (speed, direction)
+        self.pending_speed = None
+
+    # ---------------- functions ----------------
+    def _func_press(self, n):
+        """Left press: dispatch on the button's current mode."""
+        if n in self.toggle_funcs:
+            self._func_toggle(n)
+        else:
+            self._func_momentary(n, 1)
+
+    def _func_release(self, n):
+        """Left release: only momentary buttons act on it."""
+        if n not in self.toggle_funcs:
+            self._func_momentary(n, 0)
+
+    def _func_momentary(self, n, state):
+        """Press/release for a momentary-mode button. Nothing to revert
+        on a failed send: the button has no latched state, and a release lost
+        with the link leaves func_vars[n] to be corrected by the next <l>
+        broadcast."""
+        self.app.send_cmd(f"<F {self.active_cab} {n} {state}>")
+
+    def _func_toggle(self, n):
+        """Press for a toggle-mode button: one command per click, alternating
+        1/0, release ignored. A sound decoder acts on every edge, so any
+        on/off pair per click toots twice; a toggle makes exactly one edge per
+        click -- and it is also what latched functions (lights) want.
+        func_vars[n] is updated on a good send so a fast second press flips
+        the right way even before the <l> broadcast lands."""
+        var = self.func_vars[n]
+        state = 0 if var.get() else 1
+        if self.app.send_cmd(f"<F {self.active_cab} {n} {state}>"):
+            var.set(state)
+
+    def _func_mode_flip(self, n):
+        """Right-click: flip a button between momentary and toggle mode."""
+        if n in self.toggle_funcs:
+            self.toggle_funcs.discard(n)
+            self.app._log(f"-- F{n} mode: momentary", "info")
+        else:
+            self.toggle_funcs.add(n)
+            self.app._log(f"-- F{n} mode: toggle", "info")
+        self._style_func_button(n)
+        self.app._save_config()
+
+    def _style_func_button(self, n):
+        self.func_buttons[n].configure(
+            style="FuncToggle.TButton" if n in self.toggle_funcs
+            else "Func.TButton")
+
+    def _refresh_func_lamp(self, n):
+        """Paint the border frame green while Fn is on. Driven by a trace on
+        func_vars[n], so every writer -- the <l> broadcast, a toggle press,
+        _all_funcs_off, the cab-change zeroing -- repaints it for free."""
+        self.func_holders[n].configure(
+            background="#2e7d32" if self.func_vars[n].get()
+            else self.app.func_border_off)
+
+    def _all_funcs_off(self):
+        # Deliberately covers hidden buttons too: func_vars mirrors the true
+        # state from <l>, and "all off" means all, not just the ones shown.
+        for n, var in self.func_vars.items():
+            if not var.get():
+                continue
+            if not self.app.send_cmd(f"<F {self.active_cab} {n} 0>"):
+                return          # link is down; leave the rest showing their real state
+            self._set_quiet(var, 0)
+
+
+class LocoSetupDialog(tk.Toplevel):
+    """Per-loco setup: tab name, which functions the tab shows, a label for
+    each button, and removal of the loco. Changes apply when the dialog
+    closes (Done, Return, or the window close button).
+
+    Non-modal, but strictly one per loco: create it through app._open_setup,
+    which re-focuses an existing window instead of stacking a duplicate --
+    a stale duplicate closing last would silently re-apply its old values
+    over anything the first one changed (this is how renames used to get
+    reverted). panel.setup_dialog holds the open window and every close
+    path clears it via _close().
+    """
+
+    def __init__(self, app, panel):
+        super().__init__(app)
+        # Stay unmapped until built and positioned (see the end of __init__).
+        self.withdraw()
+        self.app = app
+        self.panel = panel
+        self.title(f"Setup -- {panel.tab_title()}")
+        self.transient(app)
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(row, text="Loco name:").pack(side="left")
+        self.name_var = tk.StringVar(value=panel.name)
+        self.name_entry = ttk.Entry(row, textvariable=self.name_var, width=20)
+        self.name_entry.pack(side="left", padx=6)
+        ttk.Label(row, text="(blank shows \"Loco <address>\")",
+                  foreground="#888").pack(side="left")
+        # Live rename: the tab retitles on every keystroke so the rename is
+        # visibly taking effect; the config still saves on close.
+        self.name_var.trace_add("write", lambda *_: self._name_typed())
+
+        funcs = ttk.LabelFrame(self, text="Functions on this tab")
+        funcs.pack(fill="both", expand=True, padx=8, pady=4)
+        ttk.Label(funcs, text="Tick a function to show it; "
+                              "the label becomes the button text.").grid(
+            row=0, column=0, columnspan=6, sticky="w", padx=6, pady=(4, 6))
+        self.show_vars = {}
+        self.label_vars = {}
+        for n in FUNCTIONS:
+            col, r = divmod(n, 10)   # three decade columns of check + entry
+            sv = tk.IntVar(value=1 if n in panel.show_funcs else 0)
+            lv = tk.StringVar(value=panel.labels.get(n, ""))
+            self.show_vars[n] = sv
+            self.label_vars[n] = lv
+            ttk.Checkbutton(funcs, text=f"F{n}", variable=sv).grid(
+                row=r + 1, column=col * 2, sticky="w", padx=(10, 2), pady=1)
+            ttk.Entry(funcs, textvariable=lv, width=14).grid(
+                row=r + 1, column=col * 2 + 1, sticky="w", padx=(0, 10), pady=1)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=8, pady=(4, 8))
+        ttk.Button(btns, text="Remove This Loco",
+                   command=self._remove).pack(side="left")
+        ttk.Button(btns, text="Done", command=self._done).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self._done)
+        self.bind("<Return>", lambda _e: self._done())
+        # Place the window over the throttle, not wherever the WM drops it.
+        # The position must be part of the *initial* map: the window was
+        # withdrawn above, so update_idletasks() computes the requested size
+        # without mapping, geometry() sets size+position while still hidden,
+        # and deiconify() maps it already placed. Mapping first and moving
+        # afterwards only worked one time in three on Hyprland -- a
+        # ConfigureRequest that lands between the map and the surface's
+        # first frame is dropped, and the dialog stayed parked at the
+        # monitor's top-left corner, where the panel bar covered the name
+        # row, so "rename" looked missing.
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.minsize(w, h)
+        x = app.winfo_rootx() + (app.winfo_width() - w) // 2
+        y = app.winfo_rooty() + max(0, (app.winfo_height() - h) // 3)
+        x = max(0, min(x, self.winfo_screenwidth() - w))
+        y = max(0, min(y, self.winfo_screenheight() - h))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.deiconify()
+        # Keyboard focus lands in the name entry, not the main window --
+        # some WMs open the window unfocused and typing went nowhere useful.
+        self.lift()
+        self.name_entry.focus_set()
+
+    def _name_typed(self):
+        """Trace on name_var: rename the loco and retitle its tab live."""
+        if self.panel.winfo_exists():
+            self.panel.name = self.name_var.get().strip()
+            self.app._retitle(self.panel)
+
+    def _close(self):
+        """The only way out: release the one-dialog-per-loco slot, then die."""
+        self.panel.setup_dialog = None
+        self.destroy()
+
+    def _done(self):
+        # The panel can be gone (loco removed) if things went sideways;
+        # applying to dead widgets would raise and leave the window stuck.
+        if self.panel.winfo_exists():
+            shows = {n for n, v in self.show_vars.items() if v.get()}
+            labels = {n: v.get() for n, v in self.label_vars.items()}
+            self.panel.apply_setup(self.name_var.get(), shows, labels)
+        self._close()
+
+    def _remove(self):
+        if len(self.app.loco_panels) <= 1:
+            messagebox.showinfo("Remove loco",
+                                "The last loco tab cannot be removed.",
+                                parent=self)
+            return
+        if not messagebox.askyesno(
+                "Remove loco",
+                f"Remove '{self.panel.tab_title()}' and its settings?",
+                parent=self):
+            return
+        panel = self.panel
+        # Close first: _remove_loco refuses any panel whose Setup window is
+        # still open, and that guard must not trip on this very window.
+        self._close()
+        self.app._remove_loco(panel)
+
+
+# --------------------------------------------------------------------------
 # Application
 # --------------------------------------------------------------------------
 class ThrottleApp(tk.Tk):
@@ -233,11 +794,6 @@ class ThrottleApp(tk.Tk):
 
         self.rx = queue.Queue()
         self.transport = None
-        self.syncing = False           # suppress outbound sends while updating UI
-        self.pending_speed = None
-        self.last_sent = 0.0
-        self.last_state = (None, None)  # (speed, dir) actually sent
-        self.active_cab = 3            # address _cab_changed last acted on
         self.current_ma = None         # last reading from <c>; None = unknown
         self.max_ma = None             # motor driver capability
         self.trip_ma = None            # software circuit breaker limit
@@ -261,8 +817,8 @@ class ThrottleApp(tk.Tk):
         # widgets are drawn for 13 pt, and the x11 numbers (16 pt fonts,
         # 880 px slider) push the requested window height past a MacBook
         # screen -- Tk then crushes the weighted bands to fit.
-        aqua = self.tk.call("tk", "windowingsystem") == "aqua"
-        base = 13 if aqua else 16
+        self.aqua = aqua = self.tk.call("tk", "windowingsystem") == "aqua"
+        self.font_base = base = 13 if aqua else 16
         for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont"):
             tkfont.nametofont(name).configure(size=base)
         tkfont.nametofont("TkFixedFont").configure(size=11 if aqua else 13)
@@ -277,6 +833,11 @@ class ThrottleApp(tk.Tk):
                         padding=(8, 6))
         style.configure("Stop.TButton", font=("TkDefaultFont", base, "bold"),
                         padding=(8, 4))
+        # The function-active indicator is a 3 px border painted on a
+        # tk.Frame wrapped around each button -- ttk button borders aren't
+        # colourable on aqua, a frame background is. Off = invisible.
+        self.func_border_off = (style.lookup("TFrame", "background")
+                                or self.cget("background"))
 
         # Vertical bands: row 0 (connection + track power) hugs its content;
         # rows 1 (tabs) and 2 (console) split the remaining space equally.
@@ -372,94 +933,24 @@ class ThrottleApp(tk.Tk):
         nb.add(run_tab, text="Run")
         nb.add(prog_tab, text="Programming")
 
-        # --- Loco / throttle ---------------------------------------------
-        loco = ttk.LabelFrame(run_tab, text="Locomotive")
-        loco.pack(fill="x", padx=6, pady=4)
-
-        ttk.Label(loco, text="Address:").grid(row=0, column=0, padx=(6, 2), pady=6, sticky="e")
-        self.cab = tk.IntVar(value=3)
-        spin = ttk.Spinbox(loco, from_=1, to=10293, textvariable=self.cab, width=8,
-                           command=self._cab_changed)
-        spin.grid(row=0, column=1, sticky="w")
-        # command= only fires on the arrows; catch typed addresses too
-        spin.bind("<Return>", self._cab_changed)
-        spin.bind("<FocusOut>", self._cab_changed)
-
-        self.direction = tk.IntVar(value=1)
-        # One big toggle instead of radio buttons: click flips direction.
-        # tk.Button, not ttk -- the colour is the state indicator.
-        self.dir_btn = tk.Button(loco, width=16, fg="white",
-                                 activeforeground="white",
-                                 font=("TkDefaultFont", base, "bold"),
-                                 command=self._dir_toggled)
-        self.dir_btn.grid(row=0, column=2, columnspan=2, padx=(18, 4), pady=4,
-                          sticky="ew")
-        self._refresh_dir()
-
-        ttk.Button(loco, text="STOP", width=10, style="Stop.TButton",
-                   command=self._stop).grid(row=0, column=4, padx=(18, 4))
-        estop = tk.Button(loco, text="E-STOP ALL", width=12, bg="#c62828", fg="white",
-                          activebackground="#e53935", activeforeground="white",
-                          font=("TkDefaultFont", base, "bold"),
-                          command=self._estop_all)
-        estop.grid(row=0, column=5, padx=4, pady=4)
-
-        self.speed = tk.IntVar(value=0)
-        # Aqua draws its native slider (width/sliderlength are ignored) and
-        # 880 px would set the whole window's width; the fat 45/70 knob is
-        # x11-only touch tuning.
-        self.scale = tk.Scale(loco, from_=0, to=MAX_SPEED, orient="horizontal",
-                              variable=self.speed, tickinterval=21,
-                              length=640 if aqua else 880,
-                              width=15 if aqua else 45,
-                              sliderlength=30 if aqua else 70,
-                              resolution=1, command=self._speed_moved)
-        self.scale.grid(row=1, column=0, columnspan=6, padx=10, pady=(0, 8), sticky="ew")
-        loco.columnconfigure(5, weight=1)
-
-        # --- Functions -----------------------------------------------------
-        funcs = ttk.LabelFrame(
-            run_tab, text="Functions (right-click a button: momentary/toggle)")
-        funcs.pack(fill="both", expand=True, padx=6, pady=4)
-        self.func_vars = {}
-        self.func_buttons = {}
-        self.func_holders = {}
-        # The active indicator is a 3 px border painted on a tk.Frame wrapped
-        # around each button -- ttk button borders aren't colourable on aqua,
-        # a frame background is. Off = the surrounding background, invisible.
-        self.func_border_off = (style.lookup("TFrame", "background")
-                                or self.cget("background"))
-        self.toggle_funcs = self._load_func_modes()
-        cols = 10  # decade rows: F0-F9 / F10-F19 / F20-F28
-        for i, n in enumerate(FUNCTIONS):
-            # Momentary (<F 1> on press, <F 0> on release) or toggle (one
-            # command per press, alternating 1/0). Right-click flips a
-            # button's mode; toggle mode shows as underlined text. No
-            # variable on the widget -- func_vars[n] tracks the real state
-            # via the <l> broadcast, and the trace paints the green border
-            # whenever that state changes, whoever changed it.
-            var = tk.IntVar(value=0)
-            self.func_vars[n] = var
-            holder = tk.Frame(funcs, background=self.func_border_off)
-            self.func_holders[n] = holder
-            w = ttk.Button(holder, text=f"F{n}")
-            self.func_buttons[n] = w
-            w.pack(fill="both", expand=True, padx=3, pady=3)
-            w.bind("<ButtonPress-1>", lambda e, k=n: self._func_press(k))
-            w.bind("<ButtonRelease-1>", lambda e, k=n: self._func_release(k))
-            for ev in ("<Button-3>", "<Button-2>"):  # right-click; aqua pre-Tk 8.7 reports it as 2
-                w.bind(ev, lambda e, k=n: self._func_mode_flip(k))
-            self._style_func_button(n)
-            var.trace_add("write", lambda *_, k=n: self._refresh_func_lamp(k))
-            holder.grid(row=i // cols, column=i % cols, sticky="nsew",
-                        padx=4, pady=3)
-        func_rows = (len(FUNCTIONS) + cols - 1) // cols
-        for c in range(cols):
-            funcs.columnconfigure(c, weight=1)
-        for r in range(func_rows):
-            funcs.rowconfigure(r, weight=1)
-        ttk.Button(funcs, text="All Functions Off", command=self._all_funcs_off).grid(
-            row=func_rows, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 6))
+        # --- Loco tabs -----------------------------------------------------
+        # One LocoPanel per configured loco, plus a "+" tab that adds one.
+        # The Setup... button on each tab is the only way to rename the loco
+        # and choose/label its functions -- no double-click shortcut; it
+        # stacked accidental duplicate windows on some WMs.
+        self.loco_nb = ttk.Notebook(run_tab)
+        self.loco_nb.pack(fill="both", expand=True, padx=4, pady=4)
+        self.loco_panels = []
+        for cfg in load_loco_cfgs():
+            panel = LocoPanel(self, self.loco_nb, cfg)
+            self.loco_nb.add(panel, text=panel.tab_title())
+            self.loco_panels.append(panel)
+        self._plus_tab = ttk.Frame(self.loco_nb)
+        self.loco_nb.add(self._plus_tab, text=" + ")
+        # POM and friends target this panel; tracked here because asking the
+        # notebook fails while the Programming tab is the one in front.
+        self.active_panel = self.loco_panels[0]
+        self.loco_nb.bind("<<NotebookTabChanged>>", self._loco_tab_changed)
 
         # --- Programming tab ------------------------------------------------
         svc = ttk.LabelFrame(prog_tab, text="Programming Track (service mode)")
@@ -527,7 +1018,7 @@ class ThrottleApp(tk.Tk):
 
         pom = ttk.LabelFrame(prog_tab, text="Program on Main (POM)")
         pom.pack(fill="x", padx=6, pady=4)
-        ttk.Label(pom, text="Writes to the loco selected on the Run tab. "
+        ttk.Label(pom, text="Writes to the loco tab selected on the Run tab. "
                             "No reply from the station -- watch the loco.").grid(
             row=0, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 2))
         ttk.Label(pom, text="CV:").grid(row=1, column=0, sticky="e", padx=(6, 0))
@@ -569,6 +1060,80 @@ class ThrottleApp(tk.Tk):
         e.bind("<Return>", self._send_raw)
         ttk.Button(entry_row, text="Send", command=self._send_raw).pack(side="left")
 
+    # ---------------- loco tab management ----------------
+    def _loco_tab_changed(self, _event=None):
+        sel = self.loco_nb.select()
+        if not sel:
+            return
+        widget = self.loco_nb.nametowidget(sel)
+        if widget is self._plus_tab:
+            self._add_loco()          # selecting "+" creates and selects a loco
+        elif isinstance(widget, LocoPanel):
+            self.active_panel = widget
+
+    def _open_setup(self, panel):
+        """Open the Setup window for a loco, or re-focus the one it already
+        has. One window per loco, ever -- duplicates are what used to revert
+        renames and orphan windows for removed locos."""
+        dlg = panel.setup_dialog
+        if dlg is not None and dlg.winfo_exists():
+            dlg.deiconify()
+            dlg.lift()
+            dlg.name_entry.focus_set()
+            return
+        panel.setup_dialog = LocoSetupDialog(self, panel)
+
+    def _add_loco(self):
+        used = {p.active_cab for p in self.loco_panels}
+        addr = 3
+        while addr in used:
+            addr += 1
+        panel = LocoPanel(self, self.loco_nb, default_loco_cfg(addr))
+        self.loco_nb.insert(self._plus_tab, panel, text=panel.tab_title())
+        self.loco_panels.append(panel)
+        self.loco_nb.select(panel)
+        self._save_config()
+        panel.request_state()
+        # A new tab is "Loco <addr>" until named; open Setup straight away
+        # so naming it is the first thing offered, not something to hunt for.
+        self._open_setup(panel)
+
+    def _remove_loco(self, panel):
+        """Drop a loco tab. The Setup dialog already refused the last one."""
+        if len(self.loco_panels) <= 1:
+            return
+        dlg = panel.setup_dialog
+        if dlg is not None and dlg.winfo_exists():
+            # A loco with its Setup window open cannot be removed -- the
+            # window would be left editing a corpse. (The window's own
+            # Remove button closes itself before calling here.)
+            self._log(f"-- close the Setup window for "
+                      f"'{panel.tab_title()}' first", "err")
+            return
+        idx = self.loco_panels.index(panel)
+        # Select the neighbour *before* forgetting: ttk otherwise selects the
+        # next tab, which for the rightmost loco is "+" -- and that would
+        # immediately create a new loco.
+        neighbour = self.loco_panels[idx - 1] if idx else self.loco_panels[1]
+        self.loco_nb.select(neighbour)
+        self.loco_nb.forget(panel)
+        self.loco_panels.remove(panel)
+        panel.destroy()
+        self._save_config()
+
+    def _retitle(self, panel):
+        self.loco_nb.tab(panel, text=panel.tab_title())
+
+    # ---------------- per-loco config persistence ----------------
+    def _save_config(self):
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            with open(CONFIG_PATH, "w") as f:
+                json.dump({"locos": [p.to_cfg() for p in self.loco_panels]},
+                          f, indent=1)
+        except OSError as e:
+            self._log(f"-- could not save {CONFIG_PATH}: {e}", "err")
+
     # ---------------- connection ----------------
     def _mode_changed(self):
         serial_ok = HAVE_SERIAL and self.mode.get() == "serial"
@@ -609,12 +1174,11 @@ class ThrottleApp(tk.Tk):
         self.connect_btn.configure(text="Disconnect")
         self.status.set(f"Connected to {where}")
         self._log(f"-- connected to {where}", "info")
-        # Anything the slider did while offline is not a command the user meant
-        # to issue now, and we know nothing about the loco until <l> arrives.
-        self.pending_speed = None
-        self.last_state = (None, None)
+        for p in self.loco_panels:
+            p.reset_link_state()
         self.send_cmd("<s>")          # forces native protocol mode + returns status
-        self._request_cab_state()  # sync the selected loco instead of guessing
+        for p in self.loco_panels:
+            p.request_state()         # sync every loco tab instead of guessing
 
     def _disconnect(self, why):
         if self.transport:
@@ -652,12 +1216,6 @@ class ThrottleApp(tk.Tk):
             self._disconnect(f"Send failed: {exc}")
             return False
 
-    def _set_quiet(self, var, value):
-        """Write a widget var without tripping its own callback."""
-        self.syncing = True
-        var.set(value)
-        self.syncing = False
-
     def _send_raw(self, *_):
         text = self.raw.get().strip()
         if not text:
@@ -667,77 +1225,18 @@ class ThrottleApp(tk.Tk):
         self.send_cmd(text)
         self.raw.set("")
 
-    def _send_throttle(self, speed, direction):
-        if not self.send_cmd(f"<t {self.cab.get()} {speed} {direction}>"):
-            return False
-        self.last_state = (speed, direction)
-        self.last_sent = time.monotonic()
-        return True
-
-    def _speed_moved(self, _value):
-        if self.syncing:
-            return
-        self.pending_speed = self.speed.get()
-
     def _speed_tick(self):
-        """Rate-limited send so dragging the slider doesn't flood the station."""
-        if self.transport and self.pending_speed is not None:
-            target = (self.pending_speed, self.direction.get())
-            if target == self.last_state:
-                # Slider landed back where the station already is (a nudge and
-                # an undo inside one SEND_INTERVAL). Nothing to send -- retire
-                # the request instead of re-testing it every 30 ms forever.
-                self.pending_speed = None
-            elif (time.monotonic() - self.last_sent) >= SEND_INTERVAL:
-                self._send_throttle(*target)
-                # Cleared even on a failed send: the transport is gone, and a
-                # stale value must not be replayed at the loco on reconnect.
-                self.pending_speed = None
+        """One 30 ms loop drives every panel's rate-limited throttle send."""
+        now = time.monotonic()
+        for p in self.loco_panels:
+            p.tick(now)
         self.after(30, self._speed_tick)
 
-    def _refresh_dir(self):
-        """Paint the direction toggle from self.direction.
-
-        Plain ASCII on purpose: U+25B6/25C0 arrows go through font fallback
-        (often a double-width color-emoji glyph on Linux) and render far
-        wider than tkfont measures, clipping the label. Colour carries the
-        state; the text stays plain.
-        """
-        if self.direction.get() == 1:
-            self.dir_btn.configure(text="FORWARD", bg="#2e7d32",
-                                   activebackground="#388e3c")
-        else:
-            self.dir_btn.configure(text="REVERSE", bg="#ef6c00",
-                                   activebackground="#f57c00")
-
-    def _dir_toggled(self):
-        """The toggle flips direction; a failed send flips it back."""
-        new = 1 - self.direction.get()
-        self._set_quiet(self.direction, new)
-        self._refresh_dir()
-        if not self._send_throttle(self.speed.get(), new):
-            self._set_quiet(self.direction, 1 - new)
-            self._refresh_dir()
-
-    def _cab_changed(self, *_):
-        try:
-            cab = self.cab.get()
-        except tk.TclError:        # mid-edit / non-numeric text in the spinbox
+    def _estop_all(self):
+        if not self.send_cmd("<!>"):
             return
-        if cab == self.active_cab:
-            return
-        self.active_cab = cab
-        self.syncing = True
-        self.speed.set(0)
-        self.direction.set(1)
-        for var in self.func_vars.values():
-            var.set(0)
-        self.syncing = False
-        self._refresh_dir()
-        self.pending_speed = None
-        self.last_state = (None, None)
-        self._log(f"-- loco {cab} selected", "info")
-        self._request_cab_state()
+        for p in self.loco_panels:
+            p.estop_zero()
 
     def _current_tick(self):
         """Poll <c> while connected. Quiet: this would otherwise own the log."""
@@ -785,112 +1284,6 @@ class ThrottleApp(tk.Tk):
         self.current_ma = self.max_ma = self.trip_ma = None
         self.overload = False
         self._refresh_current()
-
-    def _request_cab_state(self):
-        """<t cab> asks the station to re-broadcast <l> for this address.
-
-        Reply is a normal <l cab reg speedByte functMap> broadcast, so _handle
-        does the sync. A reg/slot of -1 means the loco isn't in the reminders
-        table yet; the zeroed UI is already the right answer in that case.
-        """
-        if self.transport:
-            self.send_cmd(f"<t {self.active_cab}>")
-
-    def _stop(self):
-        prior = self.speed.get()
-        self._set_quiet(self.speed, 0)
-        self.pending_speed = None
-        if not self._send_throttle(0, self.direction.get()):
-            self._set_quiet(self.speed, prior)   # the loco never got the stop
-
-    def _estop_all(self):
-        if not self.send_cmd("<!>"):
-            return
-        self._set_quiet(self.speed, 0)
-        self.pending_speed = None
-        self.last_state = (0, self.direction.get())
-
-    def _func_press(self, n):
-        """Left press: dispatch on the button's current mode."""
-        if n in self.toggle_funcs:
-            self._func_toggle(n)
-        else:
-            self._func_momentary(n, 1)
-
-    def _func_release(self, n):
-        """Left release: only momentary buttons act on it."""
-        if n not in self.toggle_funcs:
-            self._func_momentary(n, 0)
-
-    def _func_momentary(self, n, state):
-        """Press/release for a momentary-mode button. Nothing to revert
-        on a failed send: the button has no latched state, and a release lost
-        with the link leaves func_vars[n] to be corrected by the next <l>
-        broadcast."""
-        self.send_cmd(f"<F {self.cab.get()} {n} {state}>")
-
-    def _func_toggle(self, n):
-        """Press for a toggle-mode button: one command per click, alternating
-        1/0, release ignored. A sound decoder acts on every edge, so any
-        on/off pair per click toots twice; a toggle makes exactly one edge per
-        click -- and it is also what latched functions (lights) want.
-        func_vars[n] is updated on a good send so a fast second press flips
-        the right way even before the <l> broadcast lands."""
-        var = self.func_vars[n]
-        state = 0 if var.get() else 1
-        if self.send_cmd(f"<F {self.cab.get()} {n} {state}>"):
-            var.set(state)
-
-    def _func_mode_flip(self, n):
-        """Right-click: flip a button between momentary and toggle mode."""
-        if n in self.toggle_funcs:
-            self.toggle_funcs.discard(n)
-            self._log(f"-- F{n} mode: momentary", "info")
-        else:
-            self.toggle_funcs.add(n)
-            self._log(f"-- F{n} mode: toggle", "info")
-        self._style_func_button(n)
-        self._save_func_modes()
-
-    def _style_func_button(self, n):
-        self.func_buttons[n].configure(
-            style="FuncToggle.TButton" if n in self.toggle_funcs
-            else "Func.TButton")
-
-    def _refresh_func_lamp(self, n):
-        """Paint the border frame green while Fn is on. Driven by a trace on
-        func_vars[n], so every writer -- the <l> broadcast, a toggle press,
-        _all_funcs_off, the cab-change zeroing -- repaints it for free."""
-        self.func_holders[n].configure(
-            background="#2e7d32" if self.func_vars[n].get()
-            else self.func_border_off)
-
-    def _load_func_modes(self):
-        """The set of toggle-mode functions: CONFIG_PATH if readable and
-        sane, else the TOGGLE_FUNCS default. Numbers outside FUNCTIONS are
-        dropped rather than failing the whole file."""
-        try:
-            with open(CONFIG_PATH) as f:
-                nums = json.load(f)["toggle_funcs"]
-            return {n for n in map(int, nums) if n in FUNCTIONS}
-        except (OSError, ValueError, KeyError, TypeError):
-            return set(TOGGLE_FUNCS)
-
-    def _save_func_modes(self):
-        try:
-            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-            with open(CONFIG_PATH, "w") as f:
-                json.dump({"toggle_funcs": sorted(self.toggle_funcs)}, f)
-        except OSError as e:
-            self._log(f"-- could not save {CONFIG_PATH}: {e}", "err")
-
-    def _all_funcs_off(self):
-        for n, var in self.func_vars.items():
-            if not var.get():
-                continue
-            if not self.send_cmd(f"<F {self.cab.get()} {n} 0>"):
-                return          # link is down; leave the rest showing their real state
-            self._set_quiet(var, 0)
 
     # ---------------- programming ----------------
     def _prog_int(self, var, lo, hi, name):
@@ -949,7 +1342,7 @@ class ThrottleApp(tk.Tk):
             return
         val = self._prog_int(self.pom_val, 0, 255, "value")
         if val is not None:
-            self.send_cmd(f"<w {self.cab.get()} {cv} {val}>")
+            self.send_cmd(f"<w {self.active_panel.active_cab} {cv} {val}>")
 
     def _cv29_value(self):
         """Compose CV29 from the checkboxes plus the preserved high bits."""
@@ -1007,26 +1400,16 @@ class ThrottleApp(tk.Tk):
             return
         head = parts[0]
 
-        # <l cab reg speedByte functMap>
+        # <l cab reg speedByte functMap> -- fan out to every panel driving
+        # that address (two tabs on one cab both stay in sync).
         if head == "l" and len(parts) >= 5:
             try:
                 cab, speed_byte, func_map = int(parts[1]), int(parts[3]), int(parts[4])
             except ValueError:
                 return
-            if cab != self.cab.get():
-                return
-            direction = 1 if speed_byte & 0x80 else 0
-            raw = speed_byte & 0x7F
-            speed = 0 if raw in (0, 1) else raw - 1
-            self.syncing = True
-            self.speed.set(speed)
-            self.direction.set(direction)
-            for n, var in self.func_vars.items():
-                var.set(1 if func_map & (1 << n) else 0)
-            self.syncing = False
-            self._refresh_dir()
-            self.last_state = (speed, direction)
-            self.pending_speed = None
+            for p in self.loco_panels:
+                if p.active_cab == cab:
+                    p.sync_from_broadcast(speed_byte, func_map)
 
         # <c "CurrentMAIN" mA C "Milli" "0" max "1" trip>
         elif head == "c":
@@ -1088,6 +1471,9 @@ class ThrottleApp(tk.Tk):
         self.log.configure(state="disabled")
 
     def _on_close(self):
+        # A rename typed into a still-open Setup window has already hit the
+        # panel (live trace) but not the file; catch it on the way out.
+        self._save_config()
         if self.transport:
             try:
                 self.transport.send("<0>")

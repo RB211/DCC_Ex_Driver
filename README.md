@@ -13,16 +13,20 @@ WiThrottle bridge, no subscriptions. One Python file, stdlib only
 (pyserial is optional, for the serial connection), running entirely on your
 own network.
 
-![Run tab — throttle, direction, functions](docs/screenshot-run.png)
+![Run tab — one tab per locomotive, throttle, direction, labelled functions](docs/screenshot-run.png)
 
 ## What it does
 
 - **Drives locomotives**: 126-step speed slider, colour-coded
   forward/reverse toggle, per-loco STOP and layout-wide **E-STOP ALL**.
+- **One tab per locomotive.** Press **+** to add a loco, **Setup…** to name
+  its tab, choose which functions it shows and label each button ("F2
+  Whistle"). Every tab has its own address, throttle and function buttons,
+  and every loco's settings are remembered in `~/.config/dccex-throttle.json`.
 - **Function keys F0–F28**, each button individually switchable between
   *momentary* (on while held — horns, whistles) and *toggle* (one press
   flips the state — lights, sound enable). Right-click a button to flip its
-  mode; the choice is remembered in `~/.config/dccex-throttle.json`.
+  mode; the choice is remembered per loco.
 - **Programs decoders**: service-mode address and CV read/write on the PROG
   track, a CV29 bit editor, and Program-on-Main (POM) writes — with a
   built-in CV name lookup so results read as "CV 3 (Acceleration rate) = 24".
@@ -69,17 +73,17 @@ home network with EX-Installer, enter its IP instead.
 baud.
 
 On connect the app sends `<s>`, logs the station's version banner, and
-requests the current state of the selected loco so the controls match
+requests the current state of every loco tab so the controls match
 reality before you touch anything.
 
 ## Running trains
 
 1. Turn on track power — **ALL ON**, or **MAIN ON** if you want the
    programming track left off.
-2. Enter the loco address (3 is the factory default for most decoders,
-   and what the app starts on). Typing an address and pressing Enter, or
-   using the arrows, immediately syncs the controls to that loco's actual
-   state.
+2. Pick a loco tab, or press **+** to add one. Enter its address (3 is
+   the factory default for most decoders, and what the app starts on).
+   Typing an address and pressing Enter, or using the arrows, immediately
+   syncs that tab's controls to the loco's actual state.
 3. Drag the slider for speed, click the **FORWARD/REVERSE** button to
    change direction (green = forward, orange = reverse).
 4. Click function buttons for lights and sounds. Underlined buttons are in
@@ -91,6 +95,19 @@ reality before you touch anything.
    loco on the layout.
 
 Closing the window drops track power.
+
+### Setting up a locomotive tab
+
+![Setup window — name, visible functions, button labels](docs/screenshot-setup.png)
+
+**Setup…** on a tab opens its setup window (it also opens by itself for a
+freshly added loco). Type a name and the tab is renamed as you type; leave
+it blank and the tab reads "Loco *address*". Tick the functions this
+decoder actually uses and give each a label — the tab then shows only those
+buttons, with the label as the button text. Unlabelled layouts flow ten
+buttons to a row; labelled ones flow six so the text has room. Hidden
+functions still track the decoder's state and are still covered by **All
+Functions Off**. **Remove This Loco** deletes the tab and its settings.
 
 ## Programming CVs
 

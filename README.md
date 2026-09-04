@@ -1,5 +1,11 @@
 # DCC-EX Native Throttle
 
+> **Development branch — untested.** This branch carries work in progress
+> (multi-locomotive tabs with per-loco Setup, function labels and layouts)
+> that has **not** been run against real command-station hardware. Expect
+> rough edges. For the released, tested version use the `main` branch or
+> the [GitHub releases](https://github.com/RB211/DCC_Ex_Driver/releases).
+
 A self-hosted GUI throttle for [DCC-EX](https://dcc-ex.com/) command stations.
 It speaks the **DCC-EX native command protocol** directly to an
 EX-CommandStation over TCP or USB serial — no phone apps, no JMRI, no
